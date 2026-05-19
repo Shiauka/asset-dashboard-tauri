@@ -1,0 +1,20 @@
+[package]
+name = "asset-dashboard"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "asset_dashboard_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+chrono = "0.4"
+chrono-tz = "0.9"

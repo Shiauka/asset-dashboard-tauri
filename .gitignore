@@ -1,0 +1,29 @@
+# ── Node ──────────────────────────────────────────────
+node_modules/
+dist/
+npm-debug.log*
+*.log
+
+# ── TypeScript ─────────────────────────────────────────
+*.tsbuildinfo
+
+# ── Rust / Tauri build artifacts ───────────────────────
+src-tauri/target/
+# Auto-generated schemas (recreated on every tauri dev/build)
+src-tauri/gen/schemas/
+
+# ── Environment / secrets ──────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── OS ────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor ────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
