@@ -8,11 +8,11 @@
 
 ## 下載安裝
 
-前往 [Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases) 下載最新版本：
+| 平台 | 版本 | 下載 |
+|------|------|------|
+| Windows 10 / 11 | v0.1.0 | [資產管理儀表板_0.1.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.1.0/%E8%B3%87%E7%94%A2%E7%AE%A1%E7%90%86%E5%84%80%E8%A1%A8%E6%9D%BF_0.1.0_x64-setup.exe) |
 
-| 平台 | 下載檔案 |
-|------|---------|
-| Windows 10 / 11 | `.exe`（NSIS 安裝程式）或 `.msi` |
+所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
 > 目前僅提供 Windows 預編譯版本。macOS / Linux 使用者請參考下方[自行編譯](#自行編譯)章節。
 
