@@ -10,7 +10,7 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.1.0 | [資產管理儀表板_0.1.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.1.0/%E8%B3%87%E7%94%A2%E7%AE%A1%E7%90%86%E5%84%80%E8%A1%A8%E6%9D%BF_0.1.0_x64-setup.exe) |
+| Windows 10 / 11 | v0.1.1 | [資產管理儀表板_0.1.1_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.1.1/%E8%B3%87%E7%94%A2%E7%AE%A1%E7%90%86%E5%84%80%E8%A1%A8%E6%9D%BF_0.1.1_x64-setup.exe) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
@@ -55,7 +55,7 @@
 
 - **前端**：React 19 + TypeScript + Vite 6 + Tailwind CSS v4 + Recharts + Radix UI
 - **後端**：Tauri v2（Rust）— 負責檔案讀寫、報價抓取、歷史快照回溯更新
-- **資料儲存**：本機 JSON 檔（每日一個 `YYYY-MM-DD.json`，存放在使用者指定的根目錄）
+- **資料儲存**：本機 JSON 檔，存放在使用者指定的根目錄（每日快照 `YYYY-MM-DD.json` + 共用交易記錄 `transactions.json`）
 
 ---
 
@@ -156,7 +156,14 @@ npm run vite:dev
 
 第一次啟動後，點擊工具列的 📁 圖示，設定「根目錄」路徑（例如 `C:\Users\你的帳號\Documents\AssetDB`）。
 
-之後每次手動點「儲存」或新增交易時，會在根目錄寫入 `YYYY-MM-DD.json`。再次開啟 app 時，自動讀取最新那份並重建歷史走勢圖。
+之後每次手動點「儲存」或新增交易時，會在根目錄寫入以下檔案：
+
+| 檔案 | 說明 |
+|------|------|
+| `YYYY-MM-DD.json` | 當日持倉快照（持股數量、現金餘額、匯率、退休設定）|
+| `transactions.json` | 所有交易記錄（全域共用，不隨日期重複）|
+
+再次開啟 app 時，自動讀取最新快照與交易記錄，重建歷史走勢圖。
 
 所有資料保留在本機，不上傳任何伺服器。
 

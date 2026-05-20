@@ -243,6 +243,16 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
     let mut merged = state;
     merged["snapshots"] = serde_json::json!(snaps);
 
+    // Load transactions from dedicated file; fall back to embedded in daily file (migration path)
+    let tx_path = PathBuf::from(&root_dir).join("transactions.json");
+    if let Ok(raw) = tokio::fs::read_to_string(&tx_path).await {
+        if let Ok(txs) = serde_json::from_str::<serde_json::Value>(&raw) {
+            merged["transactions"] = txs;
+        }
+    }
+    // If transactions.json doesn't exist, merged["transactions"] from the latest daily file is used
+    // automatically (old format). Next save_snapshot call will extract it to transactions.json.
+
     serde_json::json!({
         "ok": true,
         "state": merged,
@@ -257,9 +267,22 @@ async fn save_snapshot(app: AppHandle, state: serde_json::Value) -> Result<serde
     let date = get_taiwan_date();
     let dir = PathBuf::from(&root_dir);
     tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}.json", date));
-    let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-    tokio::fs::write(&path, json).await.map_err(|e| e.to_string())?;
+
+    // Save transactions to a single shared file instead of duplicating in every daily snapshot
+    if let Some(txs) = state.get("transactions") {
+        let tx_json = serde_json::to_string_pretty(txs).map_err(|e| e.to_string())?;
+        tokio::fs::write(dir.join("transactions.json"), tx_json).await.map_err(|e| e.to_string())?;
+    }
+
+    // Write lean daily snapshot: strip transactions and snapshots (snapshots are computed on load)
+    let mut lean = state.clone();
+    if let Some(obj) = lean.as_object_mut() {
+        obj.remove("transactions");
+        obj.remove("snapshots");
+    }
+    let json = serde_json::to_string_pretty(&lean).map_err(|e| e.to_string())?;
+    tokio::fs::write(dir.join(format!("{}.json", date)), json).await.map_err(|e| e.to_string())?;
+
     Ok(serde_json::json!({ "ok": true, "date": date }))
 }
 
