@@ -45,6 +45,20 @@ export function resetState(): AppState {
   return INITIAL_STATE
 }
 
+export function clearState(): AppState {
+  if (typeof window === 'undefined') return INITIAL_STATE
+  const empty: AppState = {
+    exchange_rate: 32.0,
+    holdings: [],
+    cash_accounts: [],
+    transactions: [],
+    snapshots: [],
+    retirement: INITIAL_STATE.retirement,
+  }
+  localStorage.setItem(KEY, JSON.stringify(empty))
+  return empty
+}
+
 export function applyTransaction(
   state: AppState,
   tx: Transaction & { category?: Category; holdingName?: string; accountType?: 'bank' | 'savings_insurance'; target_pct?: number }

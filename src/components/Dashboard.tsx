@@ -9,7 +9,7 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ReferenceLine,
 } from 'recharts'
 import { invoke } from '@tauri-apps/api/core'
-import { loadState, saveState, resetState, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
+import { loadState, saveState, resetState, clearState, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
 import { getTaiwanToday } from '@/lib/dateUtils'
 import { totalAssetsTwd, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct } from '@/lib/calc'
 import { INITIAL_STATE } from '@/lib/initialData'
@@ -46,6 +46,8 @@ export default function Dashboard() {
   const [dbRootDir, setDbRootDir] = useState<string | null>(null)
   const [rebalanceCcy, setRebalanceCcy] = useState<'all' | 'TWD' | 'USD'>('all')
   const importRef = useRef<HTMLInputElement>(null)
+  const resetMenuRef = useRef<HTMLDivElement>(null)
+  const [showResetMenu, setShowResetMenu] = useState(false)
 
   const commit = useCallback((next: AppState) => {
     setState(next)
@@ -160,10 +162,27 @@ export default function Dashboard() {
     }
   }, [state, commit, saveToDb, retroactiveDbUpdate, reloadDbSnapshots])
 
-  const handleReset = () => {
-    if (!confirm('確定要重設所有資料回初始狀態？')) return
+  const handleResetToDefault = () => {
+    setShowResetMenu(false)
+    if (!confirm('確定回到預設範例？目前所有資料將被覆蓋。')) return
     setState(resetState())
   }
+
+  const handleClearAll = () => {
+    setShowResetMenu(false)
+    if (!confirm('確定清空所有資料？此操作無法復原。')) return
+    setState(clearState())
+  }
+
+  useEffect(() => {
+    if (!showResetMenu) return
+    const handler = (e: MouseEvent) => {
+      if (resetMenuRef.current && !resetMenuRef.current.contains(e.target as Node))
+        setShowResetMenu(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showResetMenu])
 
   const handleDeleteTransaction = useCallback(async (id: string) => {
     if (!state) return
@@ -325,9 +344,29 @@ export default function Dashboard() {
           <Button size="sm" variant="outline" onClick={handleImport} title="從根目錄載入最新">
             <Upload size={14} />
           </Button>
-          <Button size="sm" variant="ghost" onClick={handleReset} title="重設">
-            <RotateCcw size={14} />
-          </Button>
+          <div className="relative" ref={resetMenuRef}>
+            <Button size="sm" variant="ghost" onClick={() => setShowResetMenu(v => !v)} title="重設">
+              <RotateCcw size={14} />
+            </Button>
+            {showResetMenu && (
+              <div className="absolute right-0 top-full mt-1 z-50 min-w-[152px] rounded-md border bg-popover shadow-md py-1">
+                <button
+                  className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent text-left"
+                  onClick={handleResetToDefault}
+                >
+                  <RotateCcw size={13} />
+                  回到預設範例
+                </button>
+                <button
+                  className="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent text-left text-destructive"
+                  onClick={handleClearAll}
+                >
+                  <Trash2 size={13} />
+                  清空所有資料
+                </button>
+              </div>
+            )}
+          </div>
           <input ref={importRef} type="file" accept=".json" className="hidden" onChange={() => {}} />
         </div>
       </div>
