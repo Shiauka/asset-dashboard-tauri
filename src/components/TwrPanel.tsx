@@ -15,12 +15,11 @@ const fmt = (n: number, d = 0) =>
 const fmtPct = (n: number | null) =>
   n == null ? '—' : `${n >= 0 ? '+' : ''}${(n * 100).toFixed(2)}%`
 
-const TARGET = 0.117 // 五桶目標年化 11.7%
-
-function ReturnBadge({ value, compareTarget = false }: { value: number | null; compareTarget?: boolean }) {
+function ReturnBadge({ value, target, compareTarget = false }: { value: number | null; target?: number; compareTarget?: boolean }) {
   if (value == null) return <span className="text-muted-foreground text-2xl font-bold">—</span>
+  const t = target ?? 0
   const color = compareTarget
-    ? value >= TARGET ? 'text-emerald-600' : value >= TARGET * 0.8 ? 'text-amber-500' : 'text-red-500'
+    ? value >= t ? 'text-emerald-600' : value >= t * 0.8 ? 'text-amber-500' : 'text-red-500'
     : value >= 0 ? 'text-emerald-600' : 'text-red-500'
   return <span className={`text-2xl font-bold ${color}`}>{fmtPct(value)}</span>
 }
@@ -39,6 +38,7 @@ function downsample<T>(arr: T[], max = 80): T[] {
 }
 
 export default function TwrPanel({ state, blurred }: { state: AppState; blurred: boolean }) {
+  const TARGET = state.retirement?.expected_annual_return ?? 0.117
   const [breakdownView, setBreakdownView] = useState<'yearly' | 'monthly'>('yearly')
 
   const twr = useMemo(
@@ -74,7 +74,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
             <CardTitle className="text-sm text-muted-foreground">年化報酬率 (TWR)</CardTitle>
           </CardHeader>
           <CardContent>
-            <ReturnBadge value={twr.annualized} compareTarget />
+            <ReturnBadge value={twr.annualized} target={TARGET} compareTarget />
             <p className="text-xs text-muted-foreground mt-1">目標 +{(TARGET * 100).toFixed(1)}%</p>
           </CardContent>
         </Card>

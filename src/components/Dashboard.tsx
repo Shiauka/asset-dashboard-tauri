@@ -824,13 +824,13 @@ export default function Dashboard() {
                                 ? `${tx.bank} → ${tx.bank_to}`
                                 : (tx.symbol || tx.bank || '—')}
                             </td>
-                            <td className="text-right pr-3">{tx.shares !== undefined ? fmt(tx.shares, 2) : '—'}</td>
-                            <td className="text-right pr-3">{tx.price !== undefined ? `${tx.currency === 'USD' ? '$' : ''}${fmt(tx.price, 2)}` : '—'}</td>
+                            <td className="text-right pr-3"><A>{tx.shares !== undefined ? fmt(tx.shares, 2) : '—'}</A></td>
+                            <td className="text-right pr-3"><A>{tx.price !== undefined ? `${tx.currency === 'USD' ? '$' : ''}${fmt(tx.price, 2)}` : '—'}</A></td>
                             <td className="text-right pr-3 font-medium">
                               <A>{tx.currency === 'USD' ? `$${fmt(tx.amount, 2)}` : `${fmt(tx.amount)} TWD`}</A>
                             </td>
                             <td className="text-right pr-3 text-muted-foreground text-xs">
-                              {tx.commission ? `${tx.currency === 'USD' ? '$' : ''}${fmt(tx.commission, 2)}` : '—'}
+                              <A>{tx.commission ? `${tx.currency === 'USD' ? '$' : ''}${fmt(tx.commission, 2)}` : '—'}</A>
                             </td>
                             <td className="pr-3 text-muted-foreground text-xs">{tx.note || '—'}</td>
                             <td className="text-center">
