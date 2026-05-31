@@ -101,22 +101,23 @@ export default function Dashboard() {
               cash_accounts: (body.state.cash_accounts ?? []).map(c => ({ ...c, target_pct: c.target_pct ?? 0 })),
             }
 
-            let final = merged
-            try {
-              const pricesData = await invoke<{ prices: Record<string, number | null>; exchange_rate: number | null }>('fetch_prices', {
-                holdings: merged.holdings.map(h => ({ symbol: h.symbol, currency: h.currency })),
-              })
-              if (pricesData.exchange_rate !== null && pricesData.exchange_rate > 0)
-                final = updateExchangeRate(final, pricesData.exchange_rate)
-              for (const [sym, price] of Object.entries(pricesData.prices))
-                if (price !== null && price > 0) final = updateHoldingPrice(final, sym, price)
-              final = addSnapshot(final, totalAssetsTwd(final))
-            } catch {}
+            // 先用快照舊報價立刻顯示 UI，不等網路
+            commit(merged)
 
-            commit(final)
-            if (rootDir) {
-              invoke('save_snapshot', { state: final }).catch(() => {})
-            }
+            // 股價 + 匯率在背景更新，完成後再刷新
+            invoke<{ prices: Record<string, number | null>; exchange_rate: number | null }>('fetch_prices', {
+              holdings: merged.holdings.map(h => ({ symbol: h.symbol, currency: h.currency })),
+            }).then(pricesData => {
+              let next = merged
+              if (pricesData.exchange_rate !== null && pricesData.exchange_rate > 0)
+                next = updateExchangeRate(next, pricesData.exchange_rate)
+              for (const [sym, price] of Object.entries(pricesData.prices))
+                if (price !== null && price > 0) next = updateHoldingPrice(next, sym, price)
+              next = addSnapshot(next, totalAssetsTwd(next))
+              commit(next)
+              if (rootDir) invoke('save_snapshot', { state: next }).catch(() => {})
+            }).catch(() => {})
+
             return
           }
         } catch {}
