@@ -136,7 +136,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
               />
               <Tooltip
                 formatter={(v: unknown) => [blurred ? '***' : Number(v).toFixed(2), 'NAV']}
-                labelFormatter={d => String(d)}
+                labelFormatter={d => `日期：${d}`}
               />
               <ReferenceLine y={100} stroke="#94a3b8" strokeDasharray="4 4" />
               <Line type="monotone" dataKey="nav" stroke="#3b82f6" dot={false} strokeWidth={2} />
