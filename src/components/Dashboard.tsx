@@ -5,7 +5,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
-  PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend,
+  PieChart, Pie, Cell, Tooltip, ResponsiveContainer,
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ReferenceLine,
 } from 'recharts'
 import { invoke } from '@tauri-apps/api/core'
@@ -531,13 +531,22 @@ export default function Dashboard() {
                     <XAxis type="number" domain={[0, 55]} tickFormatter={v => `${v}%`} />
                     <YAxis type="category" dataKey="name" width={65} tick={{ fontSize: 12 }} />
                     <Tooltip formatter={(v) => `${Number(v).toFixed(1)}%`} />
-                    <Legend />
                     <Bar dataKey="目標" fill="#94a3b8" radius={[0, 3, 3, 0]} />
-                    <Bar dataKey="實際" radius={[0, 3, 3, 0]}>
+                    <Bar dataKey="實際" fill="#60a5fa" radius={[0, 3, 3, 0]}>
                       {barData.map((_, i) => <Cell key={i} fill={cats[i].color} />)}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
+                <div className="flex items-center gap-4 mt-1 px-2 text-xs text-muted-foreground">
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block w-3 h-3 rounded-sm bg-slate-400" />
+                    目標
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <span className="inline-block w-3 h-3 rounded-sm bg-blue-400" />
+                    實際
+                  </span>
+                </div>
 
                 <div className="grid grid-cols-2 gap-2 mt-4">
                   {cats.map(c => (

@@ -359,7 +359,7 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
                     return (
                       <tr
                         key={p.year}
-                        className={`border-b hover:bg-muted/30 ${isRetirementYear ? 'bg-blue-50 dark:bg-blue-950/20 font-medium' : ''}`}
+                        className={`border-b hover:bg-muted/30 ${isRetirementYear ? 'bg-blue-900/30 font-medium' : ''}`}
                       >
                         <td className="py-1.5 pr-4">
                           {p.year}

@@ -86,6 +86,9 @@ export default function EditTransactionDialog({ open, onClose, transaction: tx, 
       updates.commission = parseFloat(commission) || undefined
       updates.bank = bank && bank !== '__none' ? bank : undefined
     }
+    if (isCashTx && bank) {
+      updates.bank = bank
+    }
     onSubmit(tx.id, updates)
     onClose()
   }
@@ -171,7 +174,16 @@ export default function EditTransactionDialog({ open, onClose, transaction: tx, 
 
           {isCashTx && (
             <Row label="帳戶">
-              <span className="text-sm font-medium px-2">{tx.bank}</span>
+              <Select value={bank || '__none'} onValueChange={setBank}>
+                <SelectTrigger>
+                  <SelectValue placeholder="選擇帳戶" />
+                </SelectTrigger>
+                <SelectContent>
+                  {cashAccounts.map(c => (
+                    <SelectItem key={c.id} value={c.bank}>{c.bank}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </Row>
           )}
 

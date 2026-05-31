@@ -23,28 +23,28 @@
   --radius: 0.5rem;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-    --card: #0a0a0a;
-    --card-foreground: #ededed;
-    --popover: #0a0a0a;
-    --popover-foreground: #ededed;
-    --primary: #ededed;
-    --primary-foreground: #0f172a;
-    --secondary: #1e293b;
-    --secondary-foreground: #ededed;
-    --muted: #1e293b;
-    --muted-foreground: #94a3b8;
-    --accent: #1e293b;
-    --accent-foreground: #ededed;
-    --destructive: #7f1d1d;
-    --destructive-foreground: #ededed;
-    --border: #1e293b;
-    --input: #1e293b;
-    --ring: #3b82f6;
-  }
+/* 強制暗色（桌面 app 不依賴系統設定） */
+:root {
+  --background: #0f0f1e;
+  --foreground: #e8e8f0;
+  --card: #1a1a2e;
+  --card-foreground: #e8e8f0;
+  --popover: #1a1a2e;
+  --popover-foreground: #e8e8f0;
+  --primary: #e8e8f0;
+  --primary-foreground: #0f0f1e;
+  --secondary: #252540;
+  --secondary-foreground: #e8e8f0;
+  --muted: #252540;
+  --muted-foreground: #8888aa;
+  --accent: #252540;
+  --accent-foreground: #e8e8f0;
+  --destructive: #991b1b;
+  --destructive-foreground: #e8e8f0;
+  --border: #2a2a45;
+  --input: #2a2a45;
+  --ring: #E87930;
+  --radius: 0.5rem;
 }
 
 @theme inline {
@@ -75,5 +75,12 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Microsoft JhengHei", "微軟正黑體", Arial, Helvetica, sans-serif;
 }
+
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
+select option { background: #1a1a2e; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 3px; }
