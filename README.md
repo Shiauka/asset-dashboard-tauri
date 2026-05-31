@@ -10,7 +10,7 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.1.3 | [資產管理儀表板_0.1.3_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.1.3/%E8%B3%87%E7%94%A2%E7%AE%A1%E7%90%86%E5%84%80%E8%A1%A8%E6%9D%BF_0.1.3_x64-setup.exe) |
+| Windows 10 / 11 | v0.1.3 | [_0.1.3_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.1.3/_0.1.3_x64-setup.exe) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
