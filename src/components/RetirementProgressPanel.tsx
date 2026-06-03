@@ -75,11 +75,23 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
 
     const yearsAheadBehind = freedomYear != null ? target_year - freedomYear : null
 
-    // Latest snapshot value per year
+    // Latest snapshot value per year / per month
+    const sortedSnaps = [...(state.snapshots ?? [])].sort((a, b) => a.date.localeCompare(b.date))
     const snapsByYear: Record<number, number> = {}
-    for (const snap of [...(state.snapshots ?? [])].sort((a, b) => a.date.localeCompare(b.date))) {
+    const snapsByMonth: Record<string, number> = {}
+    for (const snap of sortedSnaps) {
       snapsByYear[parseInt(snap.date.slice(0, 4))] = snap.total_twd
+      snapsByMonth[snap.date.slice(0, 7)] = snap.total_twd
     }
+
+    // 計畫基準線：錨定在「開始追蹤日」（第一張快照），以預期報酬 + 計畫定投成長。
+    // 里程碑表用它和實際快照比對，算出「領先/落後計畫」（vs 自己的計畫，而非距最終目標）。
+    const planStart      = sortedSnaps[0]
+    const planStartValue = planStart ? planStart.total_twd : total
+    const planStartYear  = planStart ? parseInt(planStart.date.slice(0, 4)) : currentYear
+    const planStartMoAbs = planStart
+      ? parseInt(planStart.date.slice(0, 4)) * 12 + (parseInt(planStart.date.slice(5, 7)) - 1)
+      : currentYear * 12 + today.getMonth()
 
     // Chart range: earliest snapshot year → max(target_year+2, freedomYear+2)
     const firstYear = Math.min(...Object.keys(snapsByYear).map(Number), currentYear)
@@ -109,29 +121,40 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
       ? Math.round(fv(total, projRate, freedomYear - currentYear, annualContrib) / 10000)
       : null
 
-    // Milestone rows: current year → max(target_year+2, freedomYear+1)
+    // ── 年度里程碑：計畫 vs 實際 ──────────────────────────────────────
+    // 計畫值 = 從計畫基準線（第一張快照）成長；實際值 = 該年最後一張快照；
+    // 偏移 = 實際 − 計畫（領先/落後計畫，非距最終目標）。未來年份只有計畫值。
     const milestoneEnd = Math.max(target_year + 2, freedomYear != null ? freedomYear + 1 : target_year + 2)
-    const milestones = chartData.filter(p => p.year >= currentYear && p.year <= milestoneEnd && p.projected != null)
+    const yearlyMilestones: { year: number; plan: number; actual: number | null; delta: number | null }[] = []
+    for (let year = planStartYear; year <= milestoneEnd; year++) {
+      const plan = Math.round(fv(planStartValue, projRate, year - planStartYear, annualContrib) / 10000)
+      const actualTwd = snapsByYear[year] ?? (year === currentYear ? total : null)
+      const actual = actualTwd != null ? Math.round(actualTwd / 10000) : null
+      yearlyMilestones.push({ year, plan, actual, delta: actual != null ? actual - plan : null })
+    }
 
-    // Monthly milestones: next 24 months
-    const baseYear  = today.getFullYear()
-    const baseMonth = today.getMonth() + 1
-    const monthlyMilestones = Array.from({ length: 24 }, (_, i) => {
-      const m = i + 1
-      const absMonth = baseMonth + m - 1
-      const y = baseYear + Math.floor(absMonth / 12) + (absMonth % 12 === 0 ? -1 : 0)
-      const mo = ((absMonth - 1) % 12) + 1
+    // ── 月度里程碑：計畫 vs 實際（近 12 個月 + 未來 12 個月）──────────────
+    const nowMoAbs = currentYear * 12 + today.getMonth()
+    const moStart  = Math.max(planStartMoAbs, nowMoAbs - 11)
+    const moEnd    = nowMoAbs + 12
+    const monthlyMilestones: { month: string; plan: number; actual: number | null; delta: number | null }[] = []
+    for (let abs = moStart; abs <= moEnd; abs++) {
+      const y = Math.floor(abs / 12)
+      const mo = (abs % 12) + 1
       const label = `${y}-${String(mo).padStart(2, '0')}`
-      const projected = Math.round(fvMonthly(total, projRate, m, monthlyContrib) / 10000)
-      return { month: label, projected }
-    })
+      const plan = Math.round(fvMonthly(planStartValue, projRate, abs - planStartMoAbs, monthlyContrib) / 10000)
+      const actualTwd = snapsByMonth[label] ?? (abs === nowMoAbs ? total : null)
+      const actual = actualTwd != null ? Math.round(actualTwd / 10000) : null
+      monthlyMilestones.push({ month: label, plan, actual, delta: actual != null ? actual - plan : null })
+    }
 
     return {
       total, target_amount_twd, target_year, birth_year, retirement_age,
       monthly_contribution_wan, annualContrib,
       projRate, actualReturn, reqReturn,
       freedomYear, yearsAheadBehind, freedomWan,
-      chartData, milestones, monthlyMilestones, targetWan,
+      chartData, yearlyMilestones, monthlyMilestones, targetWan,
+      planStartYear,
       progress: (total / target_amount_twd) * 100,
       yearsLeft,
     }
@@ -142,9 +165,14 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
     monthly_contribution_wan, annualContrib,
     projRate, actualReturn, reqReturn,
     freedomYear, yearsAheadBehind, freedomWan,
-    chartData, milestones, monthlyMilestones, targetWan,
+    chartData, yearlyMilestones, monthlyMilestones, targetWan,
+    planStartYear,
     progress, yearsLeft,
   } = computed
+
+  const _now = new Date()
+  const currentYear = _now.getFullYear()
+  const todayYM = `${currentYear}-${String(_now.getMonth() + 1).padStart(2, '0')}`
 
   return (
     <div className="space-y-4">
@@ -322,7 +350,7 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
         <CardHeader>
           <div className="flex items-center justify-between">
             <CardTitle className="text-base">
-              {milestoneView === 'yearly' ? '年度里程碑' : '月度里程碑（未來 24 個月）'}
+              {milestoneView === 'yearly' ? '年度里程碑（計畫 vs 實際）' : '月度里程碑（近 12 + 未來 12 個月）'}
             </CardTitle>
             <div className="flex rounded-md border overflow-hidden text-xs">
               <button
@@ -347,15 +375,15 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
                 <thead>
                   <tr className="border-b text-muted-foreground text-xs">
                     <th className="text-left py-1.5 pr-4">年份</th>
-                    <th className="text-right pr-4">預測資產</th>
-                    <th className="text-right">與目標缺口</th>
+                    <th className="text-right pr-4">計畫值</th>
+                    <th className="text-right pr-4">實際值</th>
+                    <th className="text-right">領先/落後計畫</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {milestones.map(p => {
-                    const gap = (p.projected ?? 0) - targetWan
-                    const isFreedomYear  = p.year === freedomYear
+                  {yearlyMilestones.map(p => {
                     const isRetirementYear = p.year === target_year
+                    const isCurrentYear = p.year === currentYear
                     return (
                       <tr
                         key={p.year}
@@ -363,21 +391,21 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
                       >
                         <td className="py-1.5 pr-4">
                           {p.year}
+                          {isCurrentYear && (
+                            <Badge variant="outline" className="ml-2 text-xs">今年</Badge>
+                          )}
                           {isRetirementYear && (
                             <Badge variant="outline" className="ml-2 text-xs">退休目標</Badge>
                           )}
-                          {isFreedomYear && !isRetirementYear && (
-                            <Badge className="ml-2 text-xs bg-emerald-600">財務自由</Badge>
-                          )}
-                          {isFreedomYear && isRetirementYear && (
-                            <Badge className="ml-2 text-xs bg-emerald-600">財務自由</Badge>
-                          )}
+                        </td>
+                        <td className="text-right pr-4 text-muted-foreground">
+                          <B>{fmt(p.plan)} 萬</B>
                         </td>
                         <td className="text-right pr-4">
-                          <B>{fmt(p.projected ?? 0)} 萬</B>
+                          {p.actual != null ? <B>{fmt(p.actual)} 萬</B> : <span className="text-muted-foreground">—</span>}
                         </td>
-                        <td className={`text-right font-medium ${gap >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
-                          <B>{gap >= 0 ? '+' : ''}{fmt(gap)} 萬</B>
+                        <td className={`text-right font-medium ${p.delta == null ? 'text-muted-foreground' : p.delta >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                          {p.delta != null ? <B>{p.delta >= 0 ? '+' : ''}{fmt(p.delta)} 萬</B> : '—'}
                         </td>
                       </tr>
                     )
@@ -391,19 +419,26 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
                 <thead>
                   <tr className="border-b text-muted-foreground text-xs">
                     <th className="text-left py-1.5 pr-4">月份</th>
-                    <th className="text-right pr-4">預測資產</th>
-                    <th className="text-right">與目標缺口</th>
+                    <th className="text-right pr-4">計畫值</th>
+                    <th className="text-right pr-4">實際值</th>
+                    <th className="text-right">領先/落後計畫</th>
                   </tr>
                 </thead>
                 <tbody>
                   {monthlyMilestones.map(m => {
-                    const gap = m.projected - targetWan
+                    const isCurrentMonth = m.month === todayYM
                     return (
-                      <tr key={m.month} className="border-b hover:bg-muted/30">
-                        <td className="py-1.5 pr-4 font-medium">{m.month}</td>
-                        <td className="text-right pr-4"><B>{fmt(m.projected)} 萬</B></td>
-                        <td className={`text-right font-medium ${gap >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
-                          <B>{gap >= 0 ? '+' : ''}{fmt(gap)} 萬</B>
+                      <tr key={m.month} className={`border-b hover:bg-muted/30 ${isCurrentMonth ? 'bg-blue-900/30 font-medium' : ''}`}>
+                        <td className="py-1.5 pr-4 font-medium">
+                          {m.month}
+                          {isCurrentMonth && <Badge variant="outline" className="ml-2 text-xs">本月</Badge>}
+                        </td>
+                        <td className="text-right pr-4 text-muted-foreground"><B>{fmt(m.plan)} 萬</B></td>
+                        <td className="text-right pr-4">
+                          {m.actual != null ? <B>{fmt(m.actual)} 萬</B> : <span className="text-muted-foreground">—</span>}
+                        </td>
+                        <td className={`text-right font-medium ${m.delta == null ? 'text-muted-foreground' : m.delta >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                          {m.delta != null ? <B>{m.delta >= 0 ? '+' : ''}{fmt(m.delta)} 萬</B> : '—'}
                         </td>
                       </tr>
                     )
@@ -416,8 +451,10 @@ export default function RetirementProgressPanel({ state, blurred }: { state: App
       </Card>
 
       <p className="text-xs text-muted-foreground px-1">
-        成長曲線以預期年化報酬 {(projRate * 100).toFixed(1)}% + 月存 {monthly_contribution_wan} 萬（年存 {Math.round(annualContrib / 10000)} 萬）計算。
-        月度里程碑採月複利計算。本預測為估算值，非投資建議。
+        成長曲線以預期年化報酬 {(projRate * 100).toFixed(1)}% + 月存 {monthly_contribution_wan} 萬（年存 {Math.round(annualContrib / 10000)} 萬）計算（月度採月複利）。
+        里程碑的<strong>計畫值</strong>以開始追蹤日（{planStartYear} 年第一張快照）為基準成長；<strong>實際值</strong>取自快照。
+        <strong>領先/落後計畫</strong> = 實際 − 計畫，反映你相對自己計畫的進度（含報酬與實際投入差異；純投資績效見「績效分析」）。
+        本預測為估算值，非投資建議。
       </p>
     </div>
   )
