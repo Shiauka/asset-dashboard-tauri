@@ -177,6 +177,40 @@ fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64)
                 }
             }
         }
+        // Mirror the frontend retroactivelyAdjustSnapshots so back-dated transfers /
+        // new positions don't desync the on-disk history (which reload then trusts).
+        "transfer" => {
+            let amount_to = tx["amount_to"].as_f64().unwrap_or(amount);
+            if let Some(bk) = bank {
+                if let Some(arr) = state["cash_accounts"].as_array_mut() {
+                    if let Some(c) = arr.iter_mut().find(|c| c["bank"].as_str() == Some(bk)) {
+                        if let Some(a) = c["amount"].as_f64() {
+                            c["amount"] = serde_json::json!(a - sign * amount);
+                        }
+                    }
+                }
+            }
+            if let Some(bk_to) = tx["bank_to"].as_str() {
+                if let Some(arr) = state["cash_accounts"].as_array_mut() {
+                    if let Some(c) = arr.iter_mut().find(|c| c["bank"].as_str() == Some(bk_to)) {
+                        if let Some(a) = c["amount"].as_f64() {
+                            c["amount"] = serde_json::json!(a + sign * amount_to);
+                        }
+                    }
+                }
+            }
+        }
+        "new_position" => {
+            // apply (sign>0): set the holding's shares to the position size;
+            // reverse (sign<0): clear it back to 0. Matches the TS path's set-not-add.
+            if let Some(sym) = symbol {
+                if let Some(arr) = state["holdings"].as_array_mut() {
+                    if let Some(h) = arr.iter_mut().find(|h| h["symbol"].as_str() == Some(sym)) {
+                        h["shares"] = serde_json::json!(if sign > 0.0 { shares } else { 0.0 });
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -399,14 +433,34 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                 let already_synced: std::collections::HashSet<String> =
                     synced_ids.iter().cloned().collect();
 
-                let acc_map: std::collections::HashMap<String, String> = budget["accounts"]
+                // Map: budget account_id → (dashboard_bank_name, currency)
+                let acc_map: std::collections::HashMap<String, (String, String)> = budget["accounts"]
                     .as_array().cloned().unwrap_or_default()
                     .iter().filter_map(|a| {
-                        let id   = a["id"].as_str()?.to_string();
-                        let bank = a["dashboard_bank_name"].as_str()?.to_string();
+                        let id       = a["id"].as_str()?.to_string();
+                        let bank     = a["dashboard_bank_name"].as_str()?.to_string();
+                        let currency = a["currency"].as_str().unwrap_or("TWD").to_string();
                         if bank.is_empty() { return None; }
-                        Some((id, bank))
+                        Some((id, (bank, currency)))
                     }).collect();
+
+                // 雙方帳戶都在 acc_map 才算內部轉帳（跳過）；
+                // 若只有一方在 acc_map（如富邦→信用卡），仍需 sync 那一方的現金流
+                let internal_transfer_ids: std::collections::HashSet<String> = {
+                    let mut transfer_accounts: std::collections::HashMap<String, Vec<String>> = Default::default();
+                    for tx in &budget_transactions {
+                        if let (Some(tid), Some(aid)) = (
+                            tx["transfer_id"].as_str().filter(|s| !s.is_empty()),
+                            tx["account_id"].as_str(),
+                        ) {
+                            transfer_accounts.entry(tid.to_string()).or_default().push(aid.to_string());
+                        }
+                    }
+                    transfer_accounts.into_iter()
+                        .filter(|(_, aids)| aids.iter().all(|aid| acc_map.contains_key(aid)))
+                        .map(|(tid, _)| tid)
+                        .collect()
+                };
 
                 let new_cash_txs: Vec<serde_json::Value> = budget_transactions
                     .into_iter().filter(|tx| {
@@ -414,9 +468,11 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                         let ty  = tx["type"].as_str().unwrap_or("");
                         let aid = tx["account_id"].as_str().unwrap_or("");
                         let from_dash = tx["synced_from_dashboard"].as_bool() == Some(true);
-                        let is_transfer = tx["transfer_id"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+                        let transfer_id = tx["transfer_id"].as_str().unwrap_or("");
+                        let is_internal_transfer = !transfer_id.is_empty()
+                            && internal_transfer_ids.contains(transfer_id);
                         !from_dash
-                        && !is_transfer
+                        && !is_internal_transfer
                         && !id.is_empty()
                         && !already_synced.contains(id)
                         && (ty == "income" || ty == "expense")
@@ -429,7 +485,7 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                     let aid      = tx["account_id"].as_str().unwrap_or("");
                     let amt      = tx["amount"].as_f64().unwrap_or(0.0);
                     let date     = tx["date"].as_str().unwrap_or("").to_string();
-                    let bank     = acc_map.get(aid).cloned().unwrap_or_default();
+                    let (bank, currency) = acc_map.get(aid).cloned().unwrap_or_default();
                     let dash_type = if ty == "income" { "cash_in" } else { "cash_out" };
 
                     // 備註 = 分類 + 原始備註（若有）
@@ -447,6 +503,7 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                         "type": dash_type,
                         "date": date,
                         "bank": bank,
+                        "currency": currency,
                         "amount": amt,
                         "commission": 0,
                         "note": if note.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(note) },

@@ -101,14 +101,16 @@ export default function Dashboard() {
               cash_accounts: (body.state.cash_accounts ?? []).map(c => ({ ...c, target_pct: c.target_pct ?? 0 })),
             }
 
-            // 先用快照舊報價立刻顯示 UI，不等網路
-            commit(merged)
+            // 立刻用當下 cash_accounts（已含 budget sync）重建今日快照，
+            // 避免舊快照 + 新 cash_out 交易造成 TWR 假性暴增
+            const mergedWithSnap = addSnapshot(merged, totalAssetsTwd(merged))
+            commit(mergedWithSnap)
 
             // 股價 + 匯率在背景更新，完成後再刷新
             invoke<{ prices: Record<string, number | null>; exchange_rate: number | null }>('fetch_prices', {
               holdings: merged.holdings.map(h => ({ symbol: h.symbol, currency: h.currency })),
             }).then(pricesData => {
-              let next = merged
+              let next = mergedWithSnap
               if (pricesData.exchange_rate !== null && pricesData.exchange_rate > 0)
                 next = updateExchangeRate(next, pricesData.exchange_rate)
               for (const [sym, price] of Object.entries(pricesData.prices))

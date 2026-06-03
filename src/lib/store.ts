@@ -7,30 +7,44 @@ const KEY = 'asset_dashboard_v1'
 
 export function loadState(): AppState {
   if (typeof window === 'undefined') return INITIAL_STATE
+
+  // Only treat genuinely corrupt JSON as unrecoverable. A valid-but-old-schema
+  // blob must NOT fall through to INITIAL_STATE — that would silently wipe the
+  // user's holdings/transactions/snapshots. Guard every field instead.
+  let parsed: Partial<AppState> | null = null
   try {
     const raw = localStorage.getItem(KEY)
     if (!raw) return INITIAL_STATE
-    const parsed = JSON.parse(raw) as AppState
-    // Migrate old retirement format (target_year / annual_contribution_wan → new fields)
-    const r = parsed.retirement as unknown as Record<string, unknown>
-    const migratedRetirement: RetirementSettings = r.birth_year != null ? parsed.retirement : {
-      target_amount_twd:       (r.target_amount_twd as number)       ?? 20000000,
-      monthly_contribution_wan:(r.annual_contribution_wan as number ?? 60) / 12,
-      expected_annual_return:  (r.expected_annual_return as number)  ?? 0.07,
-      birth_year:              1990,
-      retirement_age:          ((r.target_year as number) ?? 2040) - 1990,
-    }
-    return {
-      ...parsed,
-      retirement: migratedRetirement,
-      snapshots: parsed.snapshots ?? [],
-      cash_accounts: parsed.cash_accounts.map(c => ({
-        ...c,
-        target_pct: c.target_pct ?? 0,
-      })),
-    }
+    parsed = JSON.parse(raw) as Partial<AppState>
   } catch {
     return INITIAL_STATE
+  }
+  if (!parsed || typeof parsed !== 'object') return INITIAL_STATE
+
+  // Migrate old retirement format (target_year / annual_contribution_wan → new fields);
+  // tolerate a missing retirement object entirely.
+  const r = (parsed.retirement ?? {}) as unknown as Record<string, unknown>
+  const migratedRetirement: RetirementSettings = r.birth_year != null
+    ? (parsed.retirement as RetirementSettings)
+    : {
+        target_amount_twd:       (r.target_amount_twd as number)        ?? 20000000,
+        monthly_contribution_wan:((r.annual_contribution_wan as number) ?? 60) / 12,
+        expected_annual_return:  (r.expected_annual_return as number)   ?? 0.07,
+        birth_year:              1990,
+        retirement_age:          ((r.target_year as number) ?? 2040) - 1990,
+      }
+
+  return {
+    ...(parsed as AppState),
+    exchange_rate: parsed.exchange_rate ?? INITIAL_STATE.exchange_rate,
+    holdings:      parsed.holdings ?? [],
+    transactions:  parsed.transactions ?? [],
+    retirement:    migratedRetirement,
+    snapshots:     parsed.snapshots ?? [],
+    cash_accounts: (parsed.cash_accounts ?? []).map(c => ({
+      ...c,
+      target_pct: c.target_pct ?? 0,
+    })),
   }
 }
 

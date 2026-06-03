@@ -27,8 +27,11 @@ export interface TWRResult {
   endDate: string
   ytdReturn: number | null
   oneYearReturn: number | null
-  yearlyReturns:  { year: string;  return: number; startValue: number; endValue: number }[]
-  monthlyReturns: { month: string; return: number; startValue: number; endValue: number }[]
+  totalGain: number | null      // 累計投資損益金額 (TWD)，排除存入/提出
+  ytdGain: number | null        // 今年至今投資損益金額 (TWD)
+  oneYearGain: number | null    // 近一年投資損益金額 (TWD)
+  yearlyReturns:  { year: string;  return: number; startValue: number; endValue: number; gain: number }[]
+  monthlyReturns: { month: string; return: number; startValue: number; endValue: number; gain: number }[]
   series: { date: string; nav: number }[]
 }
 
@@ -222,13 +225,20 @@ export function computeTWR(
   const sorted = [...snapshots].sort((a, b) => a.date.localeCompare(b.date))
   if (sorted.length < 2) return null
 
-  // Net external cash flows per date (TWD). Only cash_in / cash_out are external.
+  // Net external cash flows (TWD). Only cash_in / cash_out are external.
+  // Attach each flow to the first snapshot ON OR AFTER its date, so a flow on a
+  // day without a snapshot (app not opened that day) is still stripped from the
+  // return instead of being miscounted as investment P/L.
+  const snapDates = sorted.map(s => s.date)
   const cfMap: Record<string, number> = {}
   for (const tx of transactions) {
     if (tx.type !== 'cash_in' && tx.type !== 'cash_out') continue
-    const twd = tx.currency === 'TWD' ? tx.amount : tx.amount * exchangeRate
+    // budget-synced transactions may lack currency; default to TWD
+    const twd = (tx.currency ?? 'TWD') === 'TWD' ? tx.amount : tx.amount * exchangeRate
     const sign = tx.type === 'cash_in' ? 1 : -1
-    cfMap[tx.date] = (cfMap[tx.date] ?? 0) + sign * twd
+    const target = snapDates.find(d => d >= tx.date)
+    if (target == null) continue // flow after the last snapshot — applied once a later snapshot exists
+    cfMap[target] = (cfMap[target] ?? 0) + sign * twd
   }
 
   // Build NAV series (starts at 100) and chain HPRs
@@ -240,8 +250,11 @@ export function computeTWR(
     const vEnd = sorted[i].total_twd
     const cf = cfMap[sorted[i].date] ?? 0
     if (vStart > 0) {
-      const hpr = (vEnd - cf) / vStart
-      if (hpr > 0) nav *= hpr
+      // Net-of-flow end value. A non-positive value only arises from bad/incomplete
+      // cashflow data; clamp at 0 (=full loss) rather than silently skipping the
+      // period, which would let inflated-positive flows bias the return upward.
+      const adj = vEnd - cf
+      nav *= adj > 0 ? adj / vStart : 0
     }
     series.push({ date: sorted[i].date, nav })
   }
@@ -257,6 +270,25 @@ export function computeTWR(
   const navAt = (date: string): number | null => {
     const entry = [...series].reverse().find(s => s.date <= date)
     return entry?.nav ?? null
+  }
+
+  // Helper: portfolio TWD value at a date (nearest snapshot on or before)
+  const valueAt = (date: string): number | null => {
+    const entry = [...sorted].reverse().find(s => s.date <= date)
+    return entry?.total_twd ?? null
+  }
+  // Net external cash flow within (fromExclusive, toInclusive]. The flow attached
+  // to the period's base snapshot is treated as starting capital, not a flow.
+  const netCF = (fromExclusive: string, toInclusive: string): number => {
+    let sum = 0
+    for (const d in cfMap) if (d > fromExclusive && d <= toInclusive) sum += cfMap[d]
+    return sum
+  }
+  // Actual investment P/L in TWD over a period = ΔValue − net cash flow.
+  const gainBetween = (fromDate: string, toDate: string): number | null => {
+    const a = valueAt(fromDate), b = valueAt(toDate)
+    if (a == null || b == null) return null
+    return b - a - netCF(fromDate, toDate)
   }
 
   // YTD return
@@ -290,6 +322,7 @@ export function computeTWR(
       return: endNavY / baseNav - 1,
       startValue: base.total_twd,
       endValue: endSnap.total_twd,
+      gain: endSnap.total_twd - base.total_twd - netCF(base.date, endSnap.date),
     })
   }
 
@@ -311,10 +344,18 @@ export function computeTWR(
       return:     endNavM / baseNav - 1,
       startValue: base.total_twd,
       endValue:   endSnap.total_twd,
+      gain:       endSnap.total_twd - base.total_twd - netCF(base.date, endSnap.date),
     })
   }
 
-  return { twr, annualized, days, startDate, endDate, ytdReturn, oneYearReturn, yearlyReturns, monthlyReturns, series }
+  // Dollar gains for summary cards (actual investment P/L, excludes flows)
+  const totalGain = gainBetween(startDate, endDate)
+  const ytdBaseSnapDate = new Date(new Date(ytdBaseDate).getTime() - MS_DAY).toISOString().slice(0, 10)
+  // If no snapshot exists before this year, YTD spans the whole observation period
+  const ytdGain = valueAt(ytdBaseSnapDate) != null ? gainBetween(ytdBaseSnapDate, endDate) : totalGain
+  const oneYearGain = oneYearReturn != null ? gainBetween(oneYearAgoDate, endDate) : null
+
+  return { twr, annualized, days, startDate, endDate, ytdReturn, oneYearReturn, totalGain, ytdGain, oneYearGain, yearlyReturns, monthlyReturns, series }
 }
 
 // Rebalance assistant: given new money (in TWD), compute how to allocate across holdings.

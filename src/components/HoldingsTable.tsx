@@ -43,7 +43,7 @@ const CCY_META: Record<Currency, { label: string; color: string }> = {
   USD: { label: '美金帳戶', color: '#16A34A' },
 }
 
-function SectionHeader({ cat, total, targetPct }: { cat: Category; total: number; targetPct: number }) {
+function SectionHeader({ cat, total, targetPct, amtClass = '' }: { cat: Category; total: number; targetPct: number; amtClass?: string }) {
   const meta = CATEGORY_META[cat]
   return (
     <div
@@ -56,7 +56,7 @@ function SectionHeader({ cat, total, targetPct }: { cat: Category; total: number
           <span className="text-xs text-muted-foreground font-medium">目標 {targetPct}%</span>
         )}
       </div>
-      <span className="text-sm font-bold text-foreground">{fmt(total / 10000, 1)} 萬</span>
+      <span className={`text-sm font-bold text-foreground ${amtClass}`}>{fmt(total / 10000, 1)} 萬</span>
     </div>
   )
 }
@@ -261,7 +261,7 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
 
           return (
             <div key={cat} className="rounded-lg border overflow-hidden">
-              <SectionHeader cat={cat} total={catTotal} targetPct={catTargetPct} />
+              <SectionHeader cat={cat} total={catTotal} targetPct={catTargetPct} amtClass={amtClass} />
               <ColHeaders />
               {items.map((h, idx) => {
                 const val = holdingValueTwd(h.shares, h.price, h.currency, fx)

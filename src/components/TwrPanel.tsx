@@ -15,6 +15,26 @@ const fmt = (n: number, d = 0) =>
 const fmtPct = (n: number | null) =>
   n == null ? '—' : `${n >= 0 ? '+' : ''}${(n * 100).toFixed(2)}%`
 
+// Investment P/L in 萬 (TWD/10000) with explicit sign
+const fmtGain = (n: number) => `${n >= 0 ? '+' : '−'}${fmt(Math.abs(n) / 10000, 1)} 萬`
+
+function GainBadge({ value, blurred }: { value: number | null; blurred: boolean }) {
+  if (value == null) return null
+  const color = value >= 0 ? 'text-emerald-600' : 'text-red-500'
+  return (
+    <p className={`text-sm font-semibold mt-0.5 ${color}`}>
+      {blurred ? '***' : fmtGain(value)}
+    </p>
+  )
+}
+
+function GainLabel({ value, blurred }: { value: number | null; blurred: boolean }) {
+  if (value == null) return <span className="text-xs text-muted-foreground">—</span>
+  if (blurred) return <span className="text-xs text-muted-foreground">***</span>
+  const color = value >= 0 ? 'text-emerald-600' : 'text-red-500'
+  return <span className={`text-xs font-medium ${color}`}>{fmtGain(value)}</span>
+}
+
 function ReturnBadge({ value, target, compareTarget = false }: { value: number | null; target?: number; compareTarget?: boolean }) {
   if (value == null) return <span className="text-muted-foreground text-2xl font-bold">—</span>
   const t = target ?? 0
@@ -61,6 +81,14 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
   const chartData  = downsample(twr.series)
   const yearlyBar  = twr.yearlyReturns.map(y  => ({ ...y,  pct: parseFloat((y.return  * 100).toFixed(2)) }))
   const monthlyBar = twr.monthlyReturns.map(m => ({ ...m,  pct: parseFloat((m.return  * 100).toFixed(2)) }))
+
+  // Tooltip text: "+12.34%（+5.6 萬）" — hide the amount when blurred
+  const barLabel = (v: unknown, p: { payload?: { gain?: number } } | undefined) => {
+    const n = Number(v)
+    const g = p?.payload?.gain
+    const amt = blurred || g == null ? '' : `（${fmtGain(g)}）`
+    return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%${amt}`
+  }
   // Only show last 24 months in the bar chart to avoid overcrowding
   const monthlyBarTrimmed = monthlyBar.slice(-24)
 
@@ -85,6 +113,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
           </CardHeader>
           <CardContent>
             <ReturnBadge value={twr.twr} />
+            <GainBadge value={twr.totalGain} blurred={blurred} />
             <p className="text-xs text-muted-foreground mt-1">持倉 {twr.days} 天</p>
           </CardContent>
         </Card>
@@ -95,6 +124,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
           </CardHeader>
           <CardContent>
             <ReturnBadge value={twr.ytdReturn} />
+            <GainBadge value={twr.ytdGain} blurred={blurred} />
             <p className="text-xs text-muted-foreground mt-1">{new Date().getFullYear()} 年至今</p>
           </CardContent>
         </Card>
@@ -105,6 +135,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
           </CardHeader>
           <CardContent>
             <ReturnBadge value={twr.oneYearReturn} />
+            <GainBadge value={twr.oneYearGain} blurred={blurred} />
             <p className="text-xs text-muted-foreground mt-1">過去 365 天</p>
           </CardContent>
         </Card>
@@ -178,10 +209,8 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
                     <XAxis dataKey="year" tick={{ fontSize: 12 }} />
                     <YAxis tickFormatter={v => `${Number(v).toFixed(0)}%`} tick={{ fontSize: 11 }} width={42} />
                     <Tooltip
-                      formatter={(v: unknown) => {
-                        const n = Number(v)
-                        return [`${n >= 0 ? '+' : ''}${n.toFixed(2)}%`, '年度報酬']
-                      }}
+                      formatter={(v: unknown, _n: unknown, p: { payload?: { gain?: number } }) =>
+                        [barLabel(v, p), '年度報酬']}
                     />
                     <ReferenceLine
                       y={TARGET * 100}
@@ -203,6 +232,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
                         <th className="text-left py-1.5 pr-4">年度</th>
                         <th className="text-right pr-4">年初資產</th>
                         <th className="text-right pr-4">年末資產</th>
+                        <th className="text-right pr-4">損益金額</th>
                         <th className="text-right">年度報酬</th>
                       </tr>
                     </thead>
@@ -216,6 +246,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
                           <td className="text-right pr-4">
                             {blurred ? '***' : `${fmt(y.endValue / 10000, 1)} 萬`}
                           </td>
+                          <td className="text-right pr-4"><GainLabel value={y.gain} blurred={blurred} /></td>
                           <td className="text-right"><SmallReturnLabel value={y.return} /></td>
                         </tr>
                       ))}
@@ -231,10 +262,8 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
                     <XAxis dataKey="month" tick={{ fontSize: 10 }} interval="preserveStartEnd" />
                     <YAxis tickFormatter={v => `${Number(v).toFixed(0)}%`} tick={{ fontSize: 11 }} width={42} />
                     <Tooltip
-                      formatter={(v: unknown) => {
-                        const n = Number(v)
-                        return [`${n >= 0 ? '+' : ''}${n.toFixed(2)}%`, '月度報酬']
-                      }}
+                      formatter={(v: unknown, _n: unknown, p: { payload?: { gain?: number } }) =>
+                        [barLabel(v, p), '月度報酬']}
                     />
                     <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="4 4" />
                     <Bar dataKey="pct" radius={[3, 3, 0, 0]}>
@@ -251,6 +280,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
                         <th className="text-left py-1.5 pr-4">月份</th>
                         <th className="text-right pr-4">月初資產</th>
                         <th className="text-right pr-4">月末資產</th>
+                        <th className="text-right pr-4">損益金額</th>
                         <th className="text-right">月度報酬</th>
                       </tr>
                     </thead>
@@ -264,6 +294,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
                           <td className="text-right pr-4">
                             {blurred ? '***' : `${fmt(m.endValue / 10000, 1)} 萬`}
                           </td>
+                          <td className="text-right pr-4"><GainLabel value={m.gain} blurred={blurred} /></td>
                           <td className="text-right"><SmallReturnLabel value={m.return} /></td>
                         </tr>
                       ))}
@@ -279,6 +310,7 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
       {/* Methodology note */}
       <p className="text-xs text-muted-foreground px-1">
         TWR 僅將 <strong>cash_in / cash_out</strong> 視為外部現金流並排除其影響。
+        <strong>損益金額</strong>＝期末資產−期初資產−當期淨存入，反映純投資績效帶來的實際金額變化（不含存入 / 提出本金）。
         USD 現金流以當前匯率換算，歷史值為近似計算。
         觀測期：{twr.startDate} → {twr.endDate}（{twr.days} 天）
       </p>
