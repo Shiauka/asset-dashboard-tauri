@@ -735,8 +735,12 @@ async fn fetch_prices(holdings: Vec<HoldingInput>) -> serde_json::Value {
 fn open_url(url: String) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW (0x08000000) 避免 cmd.exe 閃出黑色主控台視窗
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         std::process::Command::new("cmd")
             .args(["/C", "start", "", &url])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| e.to_string())?;
     }
