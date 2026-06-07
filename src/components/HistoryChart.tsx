@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts'
@@ -53,9 +53,9 @@ export default function HistoryChart({ snapshots, blurred = false, holdings, cas
   ]
   const activeSymbol = selectedSymbol || allItems[0]?.id || ''
 
-  const agg = aggregate(snapshots ?? [], period)
+  const agg = useMemo(() => aggregate(snapshots ?? [], period), [snapshots, period])
 
-  const data = agg.map(s => {
+  const data = useMemo(() => agg.map(s => {
     const label = period === 'monthly' ? s.date.slice(0, 7) : s.date.slice(5)
     if (viewMode === 'total') {
       return { date: s.date, label, total: s.total_twd }
@@ -66,7 +66,7 @@ export default function HistoryChart({ snapshots, blurred = false, holdings, cas
       return row
     }
     return { date: s.date, label, value: s.holdings_twd?.[activeSymbol] ?? null, shares: s.holdings_shares?.[activeSymbol] ?? null }
-  })
+  }), [agg, period, viewMode, activeSymbol])
 
   const PERIODS: { key: Period; label: string }[] = [
     { key: 'daily', label: '每日' },

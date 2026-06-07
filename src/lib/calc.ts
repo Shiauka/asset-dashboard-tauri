@@ -217,7 +217,29 @@ export function rebalanceRows(state: AppState): RebalanceRow[] {
 // Chains sub-period HPRs between consecutive snapshots.
 // Cash flows (cash_in / cash_out) are stripped out so deposits don't inflate returns.
 // HPR_i = (V_end - CF_on_end_date) / V_start
+// One-entry memo cache. TwrPanel and RetirementProgressPanel both call computeTWR with
+// the same state.snapshots / state.transactions / exchange_rate references in a render
+// cycle; this lets the second caller reuse the first result instead of recomputing.
+// State is treated immutably (commit replaces the arrays), so reference equality is a
+// valid cache key — a new snapshot/transaction array means a cache miss and one recompute.
+let _twrCache: {
+  s: DailySnapshot[]; t: Transaction[]; fx: number; r: TWRResult | null
+} | null = null
+
 export function computeTWR(
+  snapshots: DailySnapshot[],
+  transactions: Transaction[],
+  exchangeRate: number,
+): TWRResult | null {
+  if (_twrCache && _twrCache.s === snapshots && _twrCache.t === transactions && _twrCache.fx === exchangeRate) {
+    return _twrCache.r
+  }
+  const r = computeTWRImpl(snapshots, transactions, exchangeRate)
+  _twrCache = { s: snapshots, t: transactions, fx: exchangeRate, r }
+  return r
+}
+
+function computeTWRImpl(
   snapshots: DailySnapshot[],
   transactions: Transaction[],
   exchangeRate: number,
@@ -266,16 +288,27 @@ export function computeTWR(
   const days = Math.max(1, Math.round((new Date(endDate).getTime() - new Date(startDate).getTime()) / MS_DAY))
   const annualized = days >= 30 ? Math.pow(nav / 100, 365 / days) - 1 : null
 
+  // Binary search: index of last element whose .date <= target (arr ascending by date).
+  // Replaces the previous [...arr].reverse().find() which copied the whole array per call.
+  const lastLE = <T extends { date: string }>(arr: T[], target: string): number => {
+    let lo = 0, hi = arr.length - 1, res = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (arr[mid].date <= target) { res = mid; lo = mid + 1 } else hi = mid - 1
+    }
+    return res
+  }
+
   // Helper: get NAV at a snapshot date (nearest on or before target date)
   const navAt = (date: string): number | null => {
-    const entry = [...series].reverse().find(s => s.date <= date)
-    return entry?.nav ?? null
+    const i = lastLE(series, date)
+    return i >= 0 ? series[i].nav : null
   }
 
   // Helper: portfolio TWD value at a date (nearest snapshot on or before)
   const valueAt = (date: string): number | null => {
-    const entry = [...sorted].reverse().find(s => s.date <= date)
-    return entry?.total_twd ?? null
+    const i = lastLE(sorted, date)
+    return i >= 0 ? sorted[i].total_twd : null
   }
   // Net external cash flow within (fromExclusive, toInclusive]. The flow attached
   // to the period's base snapshot is treated as starting capital, not a flow.
@@ -304,21 +337,33 @@ export function computeTWR(
     ? nav / oneYearBaseNav - 1
     : null
 
-  // Per-year breakdown
-  const years = [...new Set(sorted.map(s => s.date.slice(0, 4)))].sort()
-  const yearlyReturns: TWRResult['yearlyReturns'] = []
+  // Per-year & per-month breakdown.
+  // `sorted` is ascending, so snapshots of the same year/month are contiguous — one
+  // linear pass records each period's [first,last] index, replacing the previous
+  // O(periods × N) `sorted.filter()` per period. The period's base snapshot is the
+  // element immediately before its first index (= last snapshot before the period),
+  // which is exactly what the old `sorted.filter(s => s.date < periodStart).at(-1)` returned.
+  type PeriodGrp = { key: string; first: number; last: number }
+  const yearGrp: PeriodGrp[] = []
+  const monthGrp: PeriodGrp[] = []
+  for (let i = 0; i < sorted.length; i++) {
+    const y = sorted[i].date.slice(0, 4)
+    const m = sorted[i].date.slice(0, 7)
+    const yg = yearGrp[yearGrp.length - 1]
+    if (!yg || yg.key !== y) yearGrp.push({ key: y, first: i, last: i }); else yg.last = i
+    const mg = monthGrp[monthGrp.length - 1]
+    if (!mg || mg.key !== m) monthGrp.push({ key: m, first: i, last: i }); else mg.last = i
+  }
 
-  for (const year of years) {
-    const yearSnaps = sorted.filter(s => s.date.startsWith(year))
-    if (yearSnaps.length === 0) continue
-    const prevSnap = sorted.filter(s => s.date < `${year}-01-01`).at(-1)
-    const base = prevSnap ?? yearSnaps[0]
+  const yearlyReturns: TWRResult['yearlyReturns'] = []
+  for (const g of yearGrp) {
+    const base = g.first > 0 ? sorted[g.first - 1] : sorted[g.first]
+    const endSnap = sorted[g.last]
     const baseNav = navAt(base.date)
-    const endSnap = yearSnaps.at(-1)!
     const endNavY = navAt(endSnap.date)
     if (baseNav == null || endNavY == null || baseNav <= 0) continue
     yearlyReturns.push({
-      year,
+      year: g.key,
       return: endNavY / baseNav - 1,
       startValue: base.total_twd,
       endValue: endSnap.total_twd,
@@ -326,25 +371,19 @@ export function computeTWR(
     })
   }
 
-  // Per-month breakdown
-  const months = [...new Set(sorted.map(s => s.date.slice(0, 7)))].sort()
   const monthlyReturns: TWRResult['monthlyReturns'] = []
-
-  for (const month of months) {
-    const monthSnaps = sorted.filter(s => s.date.startsWith(month))
-    if (monthSnaps.length === 0) continue
-    const prevSnap = sorted.filter(s => s.date < `${month}-01`).at(-1)
-    const base     = prevSnap ?? monthSnaps[0]
-    const baseNav  = navAt(base.date)
-    const endSnap  = monthSnaps.at(-1)!
-    const endNavM  = navAt(endSnap.date)
+  for (const g of monthGrp) {
+    const base = g.first > 0 ? sorted[g.first - 1] : sorted[g.first]
+    const endSnap = sorted[g.last]
+    const baseNav = navAt(base.date)
+    const endNavM = navAt(endSnap.date)
     if (baseNav == null || endNavM == null || baseNav <= 0) continue
     monthlyReturns.push({
-      month,
-      return:     endNavM / baseNav - 1,
+      month: g.key,
+      return: endNavM / baseNav - 1,
       startValue: base.total_twd,
-      endValue:   endSnap.total_twd,
-      gain:       endSnap.total_twd - base.total_twd - netCF(base.date, endSnap.date),
+      endValue: endSnap.total_twd,
+      gain: endSnap.total_twd - base.total_twd - netCF(base.date, endSnap.date),
     })
   }
 

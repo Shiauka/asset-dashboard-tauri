@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { Plus, RefreshCw, Settings, Eye, EyeOff, Download, Upload, RotateCcw, Trash2, FolderOpen, Pencil, AlertTriangle, PlayCircle } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -281,34 +281,56 @@ export default function Dashboard() {
     void saveToDb(next)
   }, [commit, saveToDb])
 
+  // All per-state derivations in one memo — recomputed only when `state` changes,
+  // not on every unrelated re-render (tab switch, blur toggle, dialog open). Must sit
+  // above the early return to satisfy the rules of hooks.
+  const DEVIATION_THRESHOLD = 5
+  const derived = useMemo(() => {
+    if (!state) return null
+    const total = totalAssetsTwd(state)
+    const cats = categorySummaries(state)
+    const { birth_year, retirement_age, target_amount_twd, monthly_contribution_wan } = state.retirement
+    const target_year = birth_year + retirement_age
+    const yearsLeft = target_year - new Date().getFullYear()
+    return {
+      total,
+      totalUsd: total / state.exchange_rate,
+      cats,
+      rebalance: rebalanceRows(state),
+      deviatingBuckets: cats.filter(
+        c => c.target_pct > 0 && Math.abs(c.actual_pct - c.target_pct) >= DEVIATION_THRESHOLD,
+      ),
+      target_year,
+      progress: total / target_amount_twd,
+      remaining: target_amount_twd - total,
+      yearsLeft,
+      reqReturn: requiredAnnualReturn(total, target_amount_twd, yearsLeft, monthly_contribution_wan * 10000 * 12),
+      barData: cats.map(c => ({ name: c.name, 實際: parseFloat(c.actual_pct.toFixed(2)), 目標: c.target_pct })),
+    }
+  }, [state])
+
+  // categoryDrillDown is the only drill cost; cats.find for the meta is trivial (≤5 items).
+  const drillItems = useMemo(
+    () => (state && drillCat ? categoryDrillDown(state, drillCat) : []),
+    [state, drillCat],
+  )
+
+  // Stable component identity across renders (only changes when `blurred` toggles),
+  // so its subtree isn't unmounted/remounted on every render.
+  const A = useCallback(
+    ({ children }: { children: React.ReactNode }) =>
+      blurred ? <span className="blur-sm select-none">{children}</span> : <>{children}</>,
+    [blurred],
+  )
+
   if (!state) return <div className="flex items-center justify-center h-screen text-muted-foreground">載入中…</div>
 
-  const total = totalAssetsTwd(state)
-  const totalUsd = total / state.exchange_rate
-  const cats = categorySummaries(state)
-  const rebalance = rebalanceRows(state)
-  const DEVIATION_THRESHOLD = 5
-  const deviatingBuckets = cats.filter(
-    c => c.target_pct > 0 && Math.abs(c.actual_pct - c.target_pct) >= DEVIATION_THRESHOLD,
-  )
-  const { birth_year, retirement_age, target_amount_twd, monthly_contribution_wan } = state.retirement
-  const target_year = birth_year + retirement_age
-  const progress = total / target_amount_twd
-  const remaining = target_amount_twd - total
-  const yearsLeft = target_year - new Date().getFullYear()
-  const reqReturn = requiredAnnualReturn(total, target_amount_twd, yearsLeft, monthly_contribution_wan * 10000 * 12)
-
-  const barData = cats.map(c => ({
-    name: c.name,
-    實際: parseFloat(c.actual_pct.toFixed(2)),
-    目標: c.target_pct,
-  }))
-
-  const drillItems = drillCat ? categoryDrillDown(state, drillCat) : []
-  const drillCatMeta = drillCat ? cats.find(c => c.key === drillCat) : null
-
-  const A = ({ children }: { children: React.ReactNode }) =>
-    blurred ? <span className="blur-sm select-none">{children}</span> : <>{children}</>
+  const {
+    total, totalUsd, cats, rebalance, deviatingBuckets,
+    target_year, progress, remaining, yearsLeft, reqReturn, barData,
+  } = derived!
+  const { retirement_age, target_amount_twd } = state.retirement
+  const drillCatMeta = drillCat ? cats.find(c => c.key === drillCat) ?? null : null
 
   return (
     <div className="min-h-screen bg-background p-4 md:p-6 space-y-6">
@@ -772,9 +794,13 @@ export default function Dashboard() {
             <CardHeader className="flex flex-row items-center justify-between pb-3">
               <CardTitle className="text-base">交易紀錄</CardTitle>
               {state.transactions.length > 0 && (() => {
-                const months = [...new Set(
-                  state.transactions.map(t => t.date.slice(0, 7))
-                )].sort((a, b) => b.localeCompare(a))
+                // Single pass: month → count, instead of filtering all transactions per month.
+                const counts = new Map<string, number>()
+                for (const t of state.transactions) {
+                  const m = t.date.slice(0, 7)
+                  counts.set(m, (counts.get(m) ?? 0) + 1)
+                }
+                const months = [...counts.keys()].sort((a, b) => b.localeCompare(a))
                 return (
                   <select
                     value={txMonthFilter}
@@ -782,10 +808,9 @@ export default function Dashboard() {
                     className="text-sm border border-input rounded-md px-2 py-1 bg-background"
                   >
                     <option value="">全部（{state.transactions.length} 筆）</option>
-                    {months.map(m => {
-                      const count = state.transactions.filter(t => t.date.startsWith(m)).length
-                      return <option key={m} value={m}>{m}（{count} 筆）</option>
-                    })}
+                    {months.map(m => (
+                      <option key={m} value={m}>{m}（{counts.get(m)} 筆）</option>
+                    ))}
                   </select>
                 )
               })()}
