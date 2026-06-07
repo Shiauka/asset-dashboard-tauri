@@ -152,6 +152,25 @@ npm run vite:dev
 
 ---
 
+## 測試（回歸測試）
+
+以 [Vitest](https://vitest.dev) 守護核心計算與資料相容性，**每次 release 前必跑**（`npm run build` 會透過 `prebuild` 自動先跑，測試沒過就不編譯）。
+
+```bash
+npm test            # 跑全部測試（CI / release 用）
+npm run test:watch  # 開發時監看模式
+npm run test:update # 計算邏輯「刻意」改動、確認新結果正確後，更新 golden 快照
+```
+
+涵蓋範圍：
+
+- **`calc.test.ts` — 計算金標準回歸**：對 5 組決定性資料（含 3 年 904 筆快照 / 36 個月、現金流落在無快照日、跨年、單一快照等邊界），對 TWR、分類、再平衡、新資金分配、所需報酬率等全部計算做 snapshot 比對。任何輸出變動都會被測出來；若是預期內的改動，用 `npm run test:update` 更新快照。
+- **`store.test.ts` — 資料相容性 / 備份還原**：用合成 fixtures 涵蓋舊版資料格式（舊 retirement 結構、缺 `transactions`/`snapshots`/`target_pct` 等欄位、壞 JSON），驗證 `loadState` 正確遷移、不遺失資料、不誤清空；以及 `save → load` 還原無損。
+
+> ⚠️ 改動 `calc.ts` 的計算邏輯後，務必先跑 `npm test`。若快照測試失敗但你確定新數字正確，才用 `test:update` 更新；否則代表不小心改壞了既有計算。
+
+---
+
 ## 資料儲存說明
 
 第一次啟動後，點擊工具列的 📁 圖示，設定「根目錄」路徑（例如 `C:\Users\你的帳號\Documents\AssetDB`）。
