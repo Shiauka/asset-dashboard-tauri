@@ -145,6 +145,60 @@ pub fn check_sync(input: &SyncCheckInput) -> Vec<SyncIssue> {
     issues
 }
 
+// ── 餘額對帳（方向二：帳務管家連結帳戶 vs 儀表板快照）─────────────────────────
+//
+// 帳務管家的 bank/cash 帳戶餘額 = initial_balance + Σ income − Σ expense（含同步進來的
+// 投資/轉帳交易）。它應該對得上儀表板快照裡同名現金帳戶的金額。對不上 → 多半是
+// 重複計帳（如歷史 buy/sell 被建成交易，雙計了 initial_balance）。設 warn：使用者也
+// 可能在儀表板手動調整現金餘額而合理地產生差異。
+
+pub struct BalanceInput<'a> {
+    /// budget.json 的 accounts（原始，需含 initial_balance / type / dashboard_bank_name）
+    pub accounts: &'a [Value],
+    pub budget_txs: &'a [Value],
+    /// dashboard_bank_name → 最新快照現金金額
+    pub snapshot_cash: &'a HashMap<String, f64>,
+}
+
+pub fn check_account_balances(input: &BalanceInput) -> Vec<SyncIssue> {
+    let mut issues = Vec::new();
+    for acc in input.accounts {
+        let bank_name = match acc["dashboard_bank_name"].as_str() {
+            Some(b) if !b.is_empty() => b,
+            _ => continue,
+        };
+        // 只對帳現金帳戶；securities 走 current_value、負債帳戶語義不同
+        let ty = acc["type"].as_str().unwrap_or("");
+        if ty != "bank" && ty != "cash" { continue; }
+
+        let aid = acc["id"].as_str().unwrap_or("");
+        let mut bal = acc["initial_balance"].as_f64().unwrap_or(0.0);
+        for tx in input.budget_txs {
+            if tx["account_id"].as_str() != Some(aid) { continue; }
+            let amt = tx["amount"].as_f64().unwrap_or(0.0);
+            match tx["type"].as_str() {
+                Some("income")  => bal += amt,
+                Some("expense") => bal -= amt,
+                _ => {}
+            }
+        }
+
+        let snap = match input.snapshot_cash.get(bank_name) {
+            Some(v) => *v,
+            None => continue, // 快照沒這個銀行 → 無法對帳
+        };
+        let diff = (bal - snap).abs();
+        if diff > 1.0 {
+            issues.push(SyncIssue::warn(
+                "balance_reconcile",
+                format!("帳戶「{}」帳務管家餘額 {:.2} 與儀表板快照 {:.2} 不一致（差 {:.2}，可能重複計帳）",
+                    bank_name, bal, snap, diff),
+            ));
+        }
+    }
+    issues
+}
+
 // ── 檔案載入器：讀共用資料夾並執行檢查 ───────────────────────────────────────
 
 fn read_json(path: &Path) -> Option<Value> {
@@ -204,13 +258,48 @@ pub fn load_and_check(root: &Path) -> Result<Vec<SyncIssue>, String> {
     let budget_to_dashboard = to_list("budget_to_dashboard");
     let dashboard_to_budget = to_list("dashboard_to_budget");
 
-    Ok(check_sync(&SyncCheckInput {
+    let mut issues = check_sync(&SyncCheckInput {
         budget_txs: &budget_txs,
         acc_map: &acc_map,
         dash_txs: &dash_txs,
         budget_to_dashboard: &budget_to_dashboard,
         dashboard_to_budget: &dashboard_to_budget,
-    }))
+    });
+
+    // 餘額對帳：讀最新快照的現金帳戶金額
+    let snapshot_cash = load_latest_snapshot_cash(root);
+    let accounts = budget["accounts"].as_array().cloned().unwrap_or_default();
+    issues.extend(check_account_balances(&BalanceInput {
+        accounts: &accounts,
+        budget_txs: &budget_txs,
+        snapshot_cash: &snapshot_cash,
+    }));
+
+    Ok(issues)
+}
+
+/// 讀 snapshots/ 最新月份檔最新日期的 cash_accounts → bank_name → amount。
+fn load_latest_snapshot_cash(root: &Path) -> HashMap<String, f64> {
+    let mut out = HashMap::new();
+    let snap_dir = root.join("snapshots");
+    let Ok(rd) = std::fs::read_dir(&snap_dir) else { return out };
+    let mut months: Vec<String> = rd.filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| crate::is_month_file(n))
+        .collect();
+    months.sort();
+    let Some(last) = months.last() else { return out };
+    let Some(Value::Object(map)) = read_json(&snap_dir.join(last)) else { return out };
+    // 取最新日期那筆 state
+    let Some((_, state)) = map.into_iter().max_by(|a, b| a.0.cmp(&b.0)) else { return out };
+    if let Some(cash) = state["cash_accounts"].as_array() {
+        for c in cash {
+            if let (Some(bank), Some(amt)) = (c["bank"].as_str(), c["amount"].as_f64()) {
+                out.insert(bank.to_string(), amt);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -351,5 +440,83 @@ mod tests {
             budget_to_dashboard: &["e1".into(), "i1".into()], dashboard_to_budget: &[],
         });
         assert!(issues.is_empty(), "預期零問題，實得：{:?}", issues);
+    }
+
+    // ── 餘額對帳（方向二）─────────────────────────────────────────────────────
+    fn snap_cash(entries: &[(&str, f64)]) -> HashMap<String, f64> {
+        entries.iter().map(|(b, a)| (b.to_string(), *a)).collect()
+    }
+
+    // 餘額對得上 → 零問題
+    #[test]
+    fn balance_matches_no_issue() {
+        let accounts = vec![serde_json::json!({
+            "id": "fb", "type": "bank", "currency": "TWD",
+            "initial_balance": 1000.0, "dashboard_bank_name": "富邦 台幣現金",
+        })];
+        // initial 1000 - expense 300 = 700，快照也是 700
+        let txs = vec![budget_tx("e1", "expense", "fb", 300.0)];
+        let issues = check_account_balances(&BalanceInput {
+            accounts: &accounts, budget_txs: &txs,
+            snapshot_cash: &snap_cash(&[("富邦 台幣現金", 700.0)]),
+        });
+        assert!(issues.is_empty(), "預期零問題，實得：{:?}", issues);
+    }
+
+    // 多計一筆 expense（如歷史 buy 被重複建）→ 帳務管家餘額偏低 → balance_reconcile 報警
+    #[test]
+    fn balance_mismatch_flags_double_count() {
+        let accounts = vec![serde_json::json!({
+            "id": "fb", "type": "bank", "currency": "TWD",
+            "initial_balance": 1000.0, "dashboard_bank_name": "富邦 台幣現金",
+        })];
+        // 多了一筆雙計的投資買入 200 → 帳務管家 800，但快照仍是 1000
+        let txs = vec![budget_tx("dash_bank_x", "expense", "fb", 200.0)];
+        let issues = check_account_balances(&BalanceInput {
+            accounts: &accounts, budget_txs: &txs,
+            snapshot_cash: &snap_cash(&[("富邦 台幣現金", 1000.0)]),
+        });
+        assert_eq!(count(&issues, "balance_reconcile"), 1);
+    }
+
+    // 1 元以內的浮點差不報
+    #[test]
+    fn balance_within_tolerance_no_issue() {
+        let accounts = vec![serde_json::json!({
+            "id": "fb", "type": "bank", "currency": "TWD",
+            "initial_balance": 1152574.56, "dashboard_bank_name": "富邦 台幣現金",
+        })];
+        let issues = check_account_balances(&BalanceInput {
+            accounts: &accounts, budget_txs: &[],
+            snapshot_cash: &snap_cash(&[("富邦 台幣現金", 1152573.70)]),
+        });
+        assert!(issues.is_empty());
+    }
+
+    // securities 帳戶不對帳（current_value 邏輯不同）
+    #[test]
+    fn balance_skips_securities_account() {
+        let accounts = vec![serde_json::json!({
+            "id": "sec", "type": "securities", "currency": "USD",
+            "initial_balance": 0.0, "dashboard_bank_name": "嘉信證卷",
+        })];
+        let issues = check_account_balances(&BalanceInput {
+            accounts: &accounts, budget_txs: &[],
+            snapshot_cash: &snap_cash(&[("嘉信證卷", 99999.0)]),
+        });
+        assert!(issues.is_empty());
+    }
+
+    // 快照沒有對應銀行 → 跳過不報（無法對帳）
+    #[test]
+    fn balance_no_snapshot_entry_skipped() {
+        let accounts = vec![serde_json::json!({
+            "id": "fb", "type": "bank", "currency": "TWD",
+            "initial_balance": 1000.0, "dashboard_bank_name": "富邦 台幣現金",
+        })];
+        let issues = check_account_balances(&BalanceInput {
+            accounts: &accounts, budget_txs: &[], snapshot_cash: &snap_cash(&[]),
+        });
+        assert!(issues.is_empty());
     }
 }
