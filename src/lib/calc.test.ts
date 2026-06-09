@@ -107,3 +107,49 @@ describe('calc 金標準回歸（snapshot）', () => {
     expect(computeTWR([{ date: '2025-01-01', total_twd: 100 }], [], 32)).toBeNull()
   })
 })
+
+// ── budget sync 邊界：transfer / 缺 currency 不應污染 TWR ──────────────────────
+// computeTWR 只把 cash_in/cash_out 當外部現金流；transfer/buy/sell 應被忽略。
+// 記帳同步進來的交易可能缺 currency 欄位，需 fallback TWD 不崩潰。
+describe('computeTWR — budget sync 邊界場景', () => {
+  const SNAPS = [
+    { date: '2026-06-01', total_twd: 1_000_000 },
+    { date: '2026-06-30', total_twd: 1_100_000 },
+  ]
+
+  // 基準：完全沒有交易時的 TWR（無外部現金流，純報酬 +10%）
+  const base = computeTWR(SNAPS, [], 32)!
+
+  it('C1：type=transfer 不被當現金流，TWR 與無交易時相同', () => {
+    const txs = [{
+      id: 't1', date: '2026-06-15', type: 'transfer' as const, currency: 'TWD' as const,
+      bank: '富邦 台幣現金', bank_to: '元大 台幣現金', amount: 40000, amount_to: 40000,
+    }]
+    const r = computeTWR(SNAPS, txs, 32)
+    expect(r).not.toBeNull()
+    // transfer 不進 cfMap，期末不被扣除 → 與 base 完全一致
+    expect(r!.twr).toBeCloseTo(base.twr, 9)
+  })
+
+  it('C2：缺 currency 欄位的 cash_out 不崩潰且 fallback TWD', () => {
+    // 故意省略 currency（模擬舊版同步資料）
+    const txs = [{
+      id: 'c1', date: '2026-06-15', type: 'cash_out', bank: '富邦 台幣現金', amount: 50000,
+    } as unknown as Parameters<typeof computeTWR>[1][number]]
+    const r = computeTWR(SNAPS, txs, 32)
+    expect(r).not.toBeNull()
+    // 50000 被當 TWD 從期末扣除 → 報酬高於 base（因為剝離了流出的本金影響）
+    expect(Number.isFinite(r!.twr)).toBe(true)
+    expect(r!.twr).not.toBeCloseTo(base.twr, 6)
+  })
+
+  it('C3：含 bank_to/amount_to 的跨幣別 transfer 不影響 TWR', () => {
+    const txs = [{
+      id: 't2', date: '2026-06-10', type: 'transfer' as const, currency: 'TWD' as const,
+      bank: '富邦 台幣現金', bank_to: '嘉信 美元現金', amount: 32000, amount_to: 1000,
+    }]
+    const r = computeTWR(SNAPS, txs, 32)
+    expect(r).not.toBeNull()
+    expect(r!.twr).toBeCloseTo(base.twr, 9)
+  })
+})

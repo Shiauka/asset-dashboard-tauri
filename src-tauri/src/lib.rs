@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+pub mod sync_check;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn config_path(app: &AppHandle) -> PathBuf {
@@ -215,6 +217,163 @@ fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64)
     }
 }
 
+// ── Budget → Dashboard sync planning (pure, no IO) ──────────────────────────
+//
+// 把「記帳管家交易 → 儀表板交易」的決策邏輯抽成純函式，方便單元測試。
+// 處理四件事：
+//   A. 內部轉帳（兩側帳戶都對應看板銀行）合併成「一筆」transfer，而非兩筆 cash_in/out
+//   B. 金額為 0 的交易不同步（房貸寬限期本金=0 等雜訊）
+//   C. transfer 記錄同時記 budget_tx_id（expense 側）與 budget_tx_id_pair（income 側），
+//      讓刪除偵測查任一邊都找得到
+//   D. 產出的交易一律帶 currency 欄位
+
+/// 組合備註：分類 + 原始備註。兩者皆空回傳 Null。
+fn compose_note(category: &str, orig: &str) -> serde_json::Value {
+    match (category.is_empty(), orig.is_empty()) {
+        (false, false) => serde_json::Value::String(format!("{} · {}", category, orig)),
+        (false, true)  => serde_json::Value::String(category.to_string()),
+        (true,  false) => serde_json::Value::String(orig.to_string()),
+        (true,  true)  => serde_json::Value::Null,
+    }
+}
+
+/// 在現有看板交易中，找出對應某個 budget tx id 的位置。
+/// 同時比對 budget_tx_id（轉帳 expense 側 / 一般交易）與 budget_tx_id_pair（轉帳 income 側）。
+fn find_dash_pos_for_budget(dash_txs: &[serde_json::Value], budget_id: &str) -> Option<usize> {
+    dash_txs.iter().position(|tx| {
+        tx["budget_tx_id"].as_str() == Some(budget_id)
+            || tx["budget_tx_id_pair"].as_str() == Some(budget_id)
+    })
+}
+
+/// 規劃要新增到看板的交易。
+/// 回傳 (要新增的看板交易, 要記入 synced_ids 的 budget tx id 清單)。
+/// acc_map: budget account_id → (dashboard_bank_name, currency)
+fn plan_budget_syncs(
+    budget_txs: &[serde_json::Value],
+    acc_map: &HashMap<String, (String, String)>,
+    already_synced: &std::collections::HashSet<String>,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    // 是否為「可同步」的候選交易（共同條件）
+    let is_candidate = |tx: &serde_json::Value| -> bool {
+        let id  = tx["id"].as_str().unwrap_or("");
+        let ty  = tx["type"].as_str().unwrap_or("");
+        let amt = tx["amount"].as_f64().unwrap_or(0.0);
+        let from_dash = tx["synced_from_dashboard"].as_bool() == Some(true);
+        !from_dash
+            && !id.is_empty()
+            && !already_synced.contains(id)
+            && amt > 0.0                                   // B：零金額不同步
+            && (ty == "income" || ty == "expense")
+    };
+
+    // 依 transfer_id 分組（只看候選交易）
+    let mut transfer_groups: HashMap<String, Vec<&serde_json::Value>> = HashMap::new();
+    let mut singles: Vec<&serde_json::Value> = Vec::new();
+    for tx in budget_txs {
+        if !is_candidate(tx) { continue; }
+        let tid = tx["transfer_id"].as_str().unwrap_or("");
+        if tid.is_empty() {
+            singles.push(tx);
+        } else {
+            transfer_groups.entry(tid.to_string()).or_default().push(tx);
+        }
+    }
+
+    let mut new_txs: Vec<serde_json::Value> = Vec::new();
+    let mut new_ids: Vec<String> = Vec::new();
+
+    let bank_of  = |tx: &serde_json::Value| -> Option<(String, String)> {
+        let aid = tx["account_id"].as_str().unwrap_or("");
+        acc_map.get(aid).cloned()
+    };
+    let note_of = |tx: &serde_json::Value| -> serde_json::Value {
+        let category  = tx["category"].as_str().unwrap_or("");
+        let orig_note = tx["note"].as_str().unwrap_or("");
+        compose_note(category, orig_note)
+    };
+
+    // ── 轉帳群組 ────────────────────────────────────────────────────────────
+    for (_tid, txs) in &transfer_groups {
+        let expense = txs.iter().find(|t| t["type"].as_str() == Some("expense"));
+        let income  = txs.iter().find(|t| t["type"].as_str() == Some("income"));
+
+        match (expense, income) {
+            // A：兩側都對應看板銀行 → 合併成一筆 transfer
+            (Some(exp), Some(inc)) if bank_of(exp).is_some() && bank_of(inc).is_some() => {
+                let (bank,    currency) = bank_of(exp).unwrap();
+                let (bank_to, _)        = bank_of(inc).unwrap();
+                let exp_id = exp["id"].as_str().unwrap_or("").to_string();
+                let inc_id = inc["id"].as_str().unwrap_or("").to_string();
+                let amount    = exp["amount"].as_f64().unwrap_or(0.0);
+                let amount_to = inc["amount"].as_f64().unwrap_or(amount);
+                new_txs.push(serde_json::json!({
+                    "id": format!("budget_{}", exp_id),
+                    "type": "transfer",
+                    "date": exp["date"].as_str().unwrap_or(""),
+                    "bank": bank,
+                    "bank_to": bank_to,
+                    "currency": currency,                  // D
+                    "amount": amount,
+                    "amount_to": amount_to,                // 跨幣別轉帳兩側金額不同
+                    "commission": 0,
+                    "note": note_of(exp),
+                    "budget_tx_id": exp_id,                // C：expense 側
+                    "budget_tx_id_pair": inc_id,           // C：income 側
+                }));
+                new_ids.push(exp_id);
+                new_ids.push(inc_id);                      // 兩個 id 都標記已同步
+            }
+            // 只有 expense 側對應看板 → cash_out
+            (Some(exp), _) if bank_of(exp).is_some() => {
+                push_cash_tx(&mut new_txs, &mut new_ids, exp, &bank_of(exp).unwrap(), note_of(exp));
+            }
+            // 只有 income 側對應看板 → cash_in
+            (_, Some(inc)) if bank_of(inc).is_some() => {
+                push_cash_tx(&mut new_txs, &mut new_ids, inc, &bank_of(inc).unwrap(), note_of(inc));
+            }
+            // 兩側都不對應 → 跳過
+            _ => {}
+        }
+    }
+
+    // ── 非轉帳交易 ──────────────────────────────────────────────────────────
+    for tx in &singles {
+        if let Some(bc) = bank_of(tx) {
+            push_cash_tx(&mut new_txs, &mut new_ids, tx, &bc, note_of(tx));
+        }
+    }
+
+    (new_txs, new_ids)
+}
+
+/// 把一筆 budget 收支轉成看板 cash_in/cash_out 並推入結果集。
+fn push_cash_tx(
+    new_txs: &mut Vec<serde_json::Value>,
+    new_ids: &mut Vec<String>,
+    tx: &serde_json::Value,
+    bank_currency: &(String, String),
+    note: serde_json::Value,
+) {
+    let id        = tx["id"].as_str().unwrap_or("").to_string();
+    let ty        = tx["type"].as_str().unwrap_or("");
+    let amt       = tx["amount"].as_f64().unwrap_or(0.0);
+    let (bank, currency) = bank_currency.clone();
+    let dash_type = if ty == "income" { "cash_in" } else { "cash_out" };
+    new_txs.push(serde_json::json!({
+        "id": format!("budget_{}", id),
+        "type": dash_type,
+        "date": tx["date"].as_str().unwrap_or(""),
+        "bank": bank,
+        "currency": currency,                              // D
+        "amount": amt,
+        "commission": 0,
+        "note": note,
+        "budget_tx_id": id,
+    }));
+    new_ids.push(id);
+}
+
 // ── Migration: move legacy YYYY-MM-DD.json → snapshots/YYYY-MM.json ──────────
 
 async fn migrate_daily_to_monthly(root_dir: &PathBuf, snap_dir: &PathBuf) {
@@ -412,21 +571,28 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                     .collect();
 
                 // ── 1. 刪除偵測：已 sync 但 budget 中已不存在 → 從看板移除 ─────────
+                // 用 find_dash_pos_for_budget 同時比對 budget_tx_id 與 budget_tx_id_pair，
+                // 因此刪掉轉帳任一側都能找到那筆合併的 transfer 並一起清掉兩個 id。
                 let deleted_ids: Vec<String> = synced_ids.iter()
                     .filter(|id| !current_budget_ids.contains(*id))
                     .cloned()
                     .collect();
 
                 for del_id in &deleted_ids {
-                    if let Some(pos) = dash_txs.iter().position(|tx| {
-                        tx["budget_tx_id"].as_str() == Some(del_id.as_str())
-                    }) {
+                    if let Some(pos) = find_dash_pos_for_budget(&dash_txs, del_id) {
                         let removed = dash_txs.remove(pos);
                         // 反向還原現金帳戶金額
                         apply_delta(&mut merged, &removed, -1.0);
+                        // 同時把這筆看板交易引用的兩個 budget id 都移出 synced
+                        let main_id = removed["budget_tx_id"].as_str().map(String::from);
+                        let pair_id = removed["budget_tx_id_pair"].as_str().map(String::from);
+                        synced_ids.retain(|id| {
+                            Some(id) != main_id.as_ref() && Some(id) != pair_id.as_ref()
+                        });
                         changed = true;
+                    } else {
+                        synced_ids.retain(|id| id != del_id);
                     }
-                    synced_ids.retain(|id| id != del_id);
                 }
 
                 // ── 2. 新增：尚未 sync 的 budget 交易 → 加到看板 ─────────────────
@@ -444,58 +610,15 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                         Some((id, (bank, currency)))
                     }).collect();
 
-                // 每筆收支都 sync，包含兩方都在 acc_map 的「內部轉帳」（如富邦→元大）。
-                // 內部轉帳也要 sync 兩側，否則各銀行餘額無法反映帳戶間的資金移動。
-                // synced_ids 負責防止重複套用。
-                let new_cash_txs: Vec<serde_json::Value> = budget_transactions
-                    .into_iter().filter(|tx| {
-                        let id  = tx["id"].as_str().unwrap_or("");
-                        let ty  = tx["type"].as_str().unwrap_or("");
-                        let aid = tx["account_id"].as_str().unwrap_or("");
-                        let from_dash = tx["synced_from_dashboard"].as_bool() == Some(true);
-                        !from_dash
-                        && !id.is_empty()
-                        && !already_synced.contains(id)
-                        && (ty == "income" || ty == "expense")
-                        && acc_map.contains_key(aid)
-                    }).collect();
-
-                for tx in &new_cash_txs {
-                    let id       = tx["id"].as_str().unwrap_or("").to_string();
-                    let ty       = tx["type"].as_str().unwrap_or("");
-                    let aid      = tx["account_id"].as_str().unwrap_or("");
-                    let amt      = tx["amount"].as_f64().unwrap_or(0.0);
-                    let date     = tx["date"].as_str().unwrap_or("").to_string();
-                    let (bank, currency) = acc_map.get(aid).cloned().unwrap_or_default();
-                    let dash_type = if ty == "income" { "cash_in" } else { "cash_out" };
-
-                    // 備註 = 分類 + 原始備註（若有）
-                    let category = tx["category"].as_str().unwrap_or("").to_string();
-                    let orig_note = tx["note"].as_str().unwrap_or("").to_string();
-                    let note = match (category.is_empty(), orig_note.is_empty()) {
-                        (false, false) => format!("{} · {}", category, orig_note),
-                        (false, true)  => category,
-                        (true,  false) => orig_note,
-                        (true,  true)  => String::new(),
-                    };
-
-                    let new_tx = serde_json::json!({
-                        "id": format!("budget_{}", id),
-                        "type": dash_type,
-                        "date": date,
-                        "bank": bank,
-                        "currency": currency,
-                        "amount": amt,
-                        "commission": 0,
-                        "note": if note.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(note) },
-                        "budget_tx_id": id,
-                    });
-
+                // 純函式規劃：轉帳合併(A)、零金額過濾(B)、配對記錄(C)、currency 必帶(D)
+                let (new_txs, new_ids) =
+                    plan_budget_syncs(&budget_transactions, &acc_map, &already_synced);
+                for new_tx in new_txs {
                     apply_delta(&mut merged, &new_tx, 1.0);
                     dash_txs.push(new_tx);
-                    synced_ids.push(id);
                     changed = true;
                 }
+                synced_ids.extend(new_ids);
 
                 // ── 3. 有變更才寫檔 ───────────────────────────────────────────
                 if changed {
@@ -758,4 +881,254 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ── Tests: budget → dashboard sync planning ─────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn acc_map(entries: &[(&str, &str, &str)]) -> HashMap<String, (String, String)> {
+        entries.iter()
+            .map(|(id, bank, cur)| (id.to_string(), (bank.to_string(), cur.to_string())))
+            .collect()
+    }
+
+    fn synced(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    // 一筆 budget 收支交易
+    fn tx(id: &str, ty: &str, aid: &str, amount: f64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "type": ty, "account_id": aid, "amount": amount,
+            "date": "2026-06-09", "category": "", "note": "",
+        })
+    }
+
+    // 1
+    #[test]
+    fn sync_empty_budget_returns_empty() {
+        let (txs, ids) = plan_budget_syncs(&[], &acc_map(&[]), &synced(&[]));
+        assert!(txs.is_empty());
+        assert!(ids.is_empty());
+    }
+
+    // 2
+    #[test]
+    fn sync_expense_in_acc_map_becomes_cash_out() {
+        let budget = vec![tx("e1", "expense", "a1", 500.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, ids) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["type"], "cash_out");
+        assert_eq!(txs[0]["bank"], "富邦 台幣現金");
+        assert_eq!(txs[0]["currency"], "TWD");
+        assert_eq!(txs[0]["amount"], 500.0);
+        assert_eq!(txs[0]["id"], "budget_e1");
+        assert_eq!(txs[0]["budget_tx_id"], "e1");
+        assert_eq!(ids, vec!["e1".to_string()]);
+    }
+
+    // 3
+    #[test]
+    fn sync_income_in_acc_map_becomes_cash_in() {
+        let budget = vec![tx("i1", "income", "a1", 800.0)];
+        let map = acc_map(&[("a1", "中信 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["type"], "cash_in");
+    }
+
+    // 4（修 B）
+    #[test]
+    fn sync_zero_amount_expense_skipped() {
+        let budget = vec![tx("e0", "expense", "a1", 0.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, ids) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert!(txs.is_empty());
+        assert!(ids.is_empty());
+    }
+
+    // 5
+    #[test]
+    fn sync_account_not_in_acc_map_skipped() {
+        let budget = vec![tx("e1", "expense", "unknown", 500.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert!(txs.is_empty());
+    }
+
+    // 6
+    #[test]
+    fn sync_synced_from_dashboard_skipped() {
+        let mut t = tx("e1", "expense", "a1", 500.0);
+        t["synced_from_dashboard"] = serde_json::json!(true);
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&[t], &map, &synced(&[]));
+        assert!(txs.is_empty());
+    }
+
+    // 7
+    #[test]
+    fn sync_already_synced_id_skipped() {
+        let budget = vec![tx("e1", "expense", "a1", 500.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&["e1"]));
+        assert!(txs.is_empty());
+    }
+
+    // 轉帳配對輔助
+    fn transfer_pair(exp_id: &str, exp_aid: &str, exp_amt: f64,
+                     inc_id: &str, inc_aid: &str, inc_amt: f64,
+                     tid: &str) -> Vec<serde_json::Value> {
+        let mut e = tx(exp_id, "expense", exp_aid, exp_amt);
+        let mut i = tx(inc_id, "income",  inc_aid, inc_amt);
+        e["transfer_id"] = serde_json::json!(tid);
+        i["transfer_id"] = serde_json::json!(tid);
+        vec![e, i]
+    }
+
+    // 8（修 A）
+    #[test]
+    fn sync_transfer_both_in_acc_map_becomes_one_transfer() {
+        let budget = transfer_pair("e1", "a1", 40000.0, "i1", "a2", 40000.0, "t1");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD"), ("a2", "元大 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["type"], "transfer");
+        assert_eq!(txs[0]["bank"], "富邦 台幣現金");
+        assert_eq!(txs[0]["bank_to"], "元大 台幣現金");
+        assert_eq!(txs[0]["budget_tx_id"], "e1");
+        assert_eq!(txs[0]["budget_tx_id_pair"], "i1");
+        assert_eq!(txs[0]["amount"], 40000.0);
+        assert_eq!(txs[0]["amount_to"], 40000.0);
+    }
+
+    // 9
+    #[test]
+    fn sync_transfer_produces_both_ids_in_synced() {
+        let budget = transfer_pair("e1", "a1", 40000.0, "i1", "a2", 40000.0, "t1");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD"), ("a2", "元大 台幣現金", "TWD")]);
+        let (_, ids) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        let set: HashSet<&String> = ids.iter().collect();
+        assert!(set.contains(&"e1".to_string()));
+        assert!(set.contains(&"i1".to_string()));
+        assert_eq!(ids.len(), 2);
+    }
+
+    // 10
+    #[test]
+    fn sync_transfer_only_expense_side_becomes_cash_out() {
+        let budget = transfer_pair("e1", "a1", 5000.0, "i1", "loan", 5000.0, "t1");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]); // a2/loan 不在
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["type"], "cash_out");
+        assert_eq!(txs[0]["bank"], "富邦 台幣現金");
+    }
+
+    // 11
+    #[test]
+    fn sync_transfer_only_income_side_becomes_cash_in() {
+        let budget = transfer_pair("e1", "loan", 5000.0, "i1", "a1", 5000.0, "t1");
+        let map = acc_map(&[("a1", "中信 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert_eq!(txs.len(), 1);
+        assert_eq!(txs[0]["type"], "cash_in");
+    }
+
+    // 12
+    #[test]
+    fn sync_transfer_neither_side_skipped() {
+        let budget = transfer_pair("e1", "x", 5000.0, "i1", "y", 5000.0, "t1");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, ids) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert!(txs.is_empty());
+        assert!(ids.is_empty());
+    }
+
+    // 13
+    #[test]
+    fn sync_transfer_cross_currency_has_amount_to() {
+        let budget = transfer_pair("e1", "a1", 40000.0, "i1", "a2", 1200.0, "t1");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD"), ("a2", "嘉信 美元現金", "USD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert_eq!(txs[0]["amount"], 40000.0);
+        assert_eq!(txs[0]["amount_to"], 1200.0);
+        assert_eq!(txs[0]["currency"], "TWD"); // expense 側幣別
+    }
+
+    // 14（修 D）
+    #[test]
+    fn sync_currency_always_in_output() {
+        let budget = vec![tx("e1", "expense", "a1", 500.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "USD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert!(txs[0].get("currency").is_some());
+        assert_eq!(txs[0]["currency"], "USD");
+    }
+
+    // 15
+    #[test]
+    fn sync_note_composed_from_category_and_note() {
+        let mut t = tx("e1", "expense", "a1", 100.0);
+        t["category"] = serde_json::json!("餐飲");
+        t["note"] = serde_json::json!("7-11");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&[t], &map, &synced(&[]));
+        assert_eq!(txs[0]["note"], "餐飲 · 7-11");
+    }
+
+    // 16
+    #[test]
+    fn sync_note_category_only() {
+        let mut t = tx("e1", "expense", "a1", 100.0);
+        t["category"] = serde_json::json!("餐飲");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&[t], &map, &synced(&[]));
+        assert_eq!(txs[0]["note"], "餐飲");
+    }
+
+    // 17
+    #[test]
+    fn sync_note_empty_is_null() {
+        let budget = vec![tx("e1", "expense", "a1", 100.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&[]));
+        assert!(txs[0]["note"].is_null());
+    }
+
+    // 18
+    #[test]
+    fn sync_transfer_both_already_synced_skipped() {
+        let budget = transfer_pair("e1", "a1", 40000.0, "i1", "a2", 40000.0, "t1");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD"), ("a2", "元大 台幣現金", "TWD")]);
+        let (txs, _) = plan_budget_syncs(&budget, &map, &synced(&["e1", "i1"]));
+        assert!(txs.is_empty());
+    }
+
+    // 19（修 C 前置）
+    #[test]
+    fn find_dash_pos_by_main_id() {
+        let dash = vec![
+            serde_json::json!({ "budget_tx_id": "other" }),
+            serde_json::json!({ "budget_tx_id": "e1", "budget_tx_id_pair": "i1" }),
+        ];
+        assert_eq!(find_dash_pos_for_budget(&dash, "e1"), Some(1));
+    }
+
+    // 20（修 C）
+    #[test]
+    fn find_dash_pos_by_pair_id() {
+        let dash = vec![
+            serde_json::json!({ "budget_tx_id": "other" }),
+            serde_json::json!({ "budget_tx_id": "e1", "budget_tx_id_pair": "i1" }),
+        ];
+        // 用 income 側 id 也要找得到那筆 transfer
+        assert_eq!(find_dash_pos_for_budget(&dash, "i1"), Some(1));
+        assert_eq!(find_dash_pos_for_budget(&dash, "nope"), None);
+    }
 }
