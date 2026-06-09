@@ -444,35 +444,16 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
                         Some((id, (bank, currency)))
                     }).collect();
 
-                // 雙方帳戶都在 acc_map 才算內部轉帳（跳過）；
-                // 若只有一方在 acc_map（如富邦→信用卡），仍需 sync 那一方的現金流
-                let internal_transfer_ids: std::collections::HashSet<String> = {
-                    let mut transfer_accounts: std::collections::HashMap<String, Vec<String>> = Default::default();
-                    for tx in &budget_transactions {
-                        if let (Some(tid), Some(aid)) = (
-                            tx["transfer_id"].as_str().filter(|s| !s.is_empty()),
-                            tx["account_id"].as_str(),
-                        ) {
-                            transfer_accounts.entry(tid.to_string()).or_default().push(aid.to_string());
-                        }
-                    }
-                    transfer_accounts.into_iter()
-                        .filter(|(_, aids)| aids.iter().all(|aid| acc_map.contains_key(aid)))
-                        .map(|(tid, _)| tid)
-                        .collect()
-                };
-
+                // 每筆收支都 sync，包含兩方都在 acc_map 的「內部轉帳」（如富邦→元大）。
+                // 內部轉帳也要 sync 兩側，否則各銀行餘額無法反映帳戶間的資金移動。
+                // synced_ids 負責防止重複套用。
                 let new_cash_txs: Vec<serde_json::Value> = budget_transactions
                     .into_iter().filter(|tx| {
                         let id  = tx["id"].as_str().unwrap_or("");
                         let ty  = tx["type"].as_str().unwrap_or("");
                         let aid = tx["account_id"].as_str().unwrap_or("");
                         let from_dash = tx["synced_from_dashboard"].as_bool() == Some(true);
-                        let transfer_id = tx["transfer_id"].as_str().unwrap_or("");
-                        let is_internal_transfer = !transfer_id.is_empty()
-                            && internal_transfer_ids.contains(transfer_id);
                         !from_dash
-                        && !is_internal_transfer
                         && !id.is_empty()
                         && !already_synced.contains(id)
                         && (ty == "income" || ty == "expense")
