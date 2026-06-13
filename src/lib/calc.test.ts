@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
-  totalAssetsTwd, totalTargetPct, categorySummaries, categoryDrillDown,
+  totalAssetsTwd, assetsByCurrency, totalTargetPct, categorySummaries, categoryDrillDown,
   rebalanceRows, computeTWR, computeNewMoneyAllocation, requiredAnnualReturn,
 } from './calc'
 import type { AppState, Category } from './types'
@@ -105,6 +105,33 @@ describe('calc 金標準回歸（snapshot）', () => {
 
   it('computeTWR 單一快照回 null', () => {
     expect(computeTWR([{ date: '2025-01-01', total_twd: 100 }], [], 32)).toBeNull()
+  })
+})
+
+// ── assetsByCurrency：按計價幣別拆分，且要與 totalAssetsTwd 對帳 ────────────────
+describe('assetsByCurrency', () => {
+  it('台幣資產用原值、美元資產用原值，不互相換算', () => {
+    const s = baseState()
+    const { twd, usd } = assetsByCurrency(s)
+    // 台幣持倉 0050(900,000) + 00631L(480,000) + 台幣現金(300,000)
+    expect(twd).toBe(1_680_000)
+    // 美元持倉 14,400+8,800+2,500+1,760+3,300+600+2,500 + 美元現金 5,000
+    expect(usd).toBe(38_860)
+  })
+
+  it('台幣資產 + 美元資產折台幣 = totalAssetsTwd（對帳不變量）', () => {
+    const s = baseState()
+    const { twd, usdInTwd } = assetsByCurrency(s)
+    expect(twd + usdInTwd).toBeCloseTo(totalAssetsTwd(s), 6)
+  })
+
+  it('沒有美元部位時 usd 為 0', () => {
+    const s = baseState()
+    s.holdings = s.holdings.filter(h => h.currency === 'TWD')
+    s.cash_accounts = s.cash_accounts.filter(c => c.currency === 'TWD')
+    const { usd, usdInTwd } = assetsByCurrency(s)
+    expect(usd).toBe(0)
+    expect(usdInTwd).toBe(0)
   })
 })
 

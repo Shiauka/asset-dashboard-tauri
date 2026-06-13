@@ -45,6 +45,7 @@ export interface RetirementSettings {
   birth_year: number
   retirement_age: number
   // Derived: target_year = birth_year + retirement_age
+  rebalance_threshold_pct?: number   // 再平衡偏離警示門檻 %，未設定預設 5
 }
 
 export interface DailySnapshot {

@@ -62,6 +62,23 @@ export function totalAssetsTwd(state: AppState): number {
   return holdingsVal + cashVal
 }
 
+// 按計價幣別拆分資產：台幣資產用台幣原值加總、美元資產用美元原值加總。
+// usdInTwd 是美元資產的台幣折算值，twd + usdInTwd 必然等於 totalAssetsTwd（可對帳）。
+export function assetsByCurrency(state: AppState): { twd: number; usd: number; usdInTwd: number } {
+  const { exchange_rate: fx, holdings, cash_accounts } = state
+  let twd = 0
+  let usd = 0
+  for (const h of holdings) {
+    if (h.currency === 'USD') usd += h.shares * h.price
+    else twd += h.shares * h.price
+  }
+  for (const c of cash_accounts) {
+    if (c.currency === 'USD') usd += c.amount
+    else twd += c.amount
+  }
+  return { twd, usd, usdInTwd: usd * fx }
+}
+
 // 計算全部目標%加總（用於警示是否超過/低於 100%）
 export function totalTargetPct(state: AppState): number {
   const holdingTotal = state.holdings.reduce((s, h) => s + h.target_pct, 0)

@@ -1,5 +1,9 @@
 @import "tailwindcss";
 
+/* 強制暗色 app：讓 Tailwind 的 dark: variant 永遠生效（不依賴系統設定）。
+   原本 v4 預設 dark: = prefers-color-scheme，OS 在亮色時下拉選單會變白底。 */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #ffffff;
   --foreground: #171717;
@@ -25,6 +29,9 @@
 
 /* 強制暗色（桌面 app 不依賴系統設定） */
 :root {
+  /* 讓瀏覽器原生控制項（日期選擇器圖示與彈出月曆、數字微調鈕、自動填入、捲軸）
+     以暗色渲染，否則日期 icon 會是黑色、在深底上幾乎看不見 */
+  color-scheme: dark;
   --background: #0f0f1e;
   --foreground: #e8e8f0;
   --card: #1a1a2e;
@@ -72,6 +79,12 @@
   --radius-lg: var(--radius);
 }
 
+/* 永遠預留垂直捲軸的寬度，避免不同 tab 內容高度不一時捲軸出現/消失，
+   導致頁面寬度跳動、上方 KPI 卡水平位移。 */
+html {
+  scrollbar-gutter: stable;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
@@ -80,6 +93,17 @@ body {
 
 input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; }
 select option { background: #1a1a2e; }
+
+/* 日期選擇器的月曆 icon：強制純白以確保在深底上清楚可見。
+   brightness(0) 先把 icon 壓成全黑、invert(1) 再翻成全白，
+   不論 color-scheme 把原生 icon 渲染成什麼色都穩定輸出白色。 */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: brightness(0) invert(1);
+  cursor: pointer;
+  opacity: 0.9;
+  transition: opacity 0.15s;
+}
+input[type="date"]::-webkit-calendar-picker-indicator:hover { opacity: 1; }
 
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }

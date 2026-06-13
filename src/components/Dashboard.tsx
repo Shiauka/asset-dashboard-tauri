@@ -11,7 +11,7 @@ import {
 import { invoke } from '@tauri-apps/api/core'
 import { loadState, saveState, resetState, clearState, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
 import { getTaiwanToday } from '@/lib/dateUtils'
-import { totalAssetsTwd, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct } from '@/lib/calc'
+import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct } from '@/lib/calc'
 import { INITIAL_STATE } from '@/lib/initialData'
 import { DEMO_STATE } from '@/lib/demoData'
 import type { AppState, Transaction, TxType, Category, RetirementSettings } from '@/lib/types'
@@ -245,6 +245,11 @@ export default function Dashboard() {
     commit(updateRetirement(state, settings))
   }
 
+  const handleThresholdChange = (pct: number) => {
+    if (!state) return
+    commit(updateRetirement(state, { rebalance_threshold_pct: pct }))
+  }
+
   const handleExport = async () => {
     if (!state) return
     if (!dbRootDir) { alert('請先在「根目錄設定」中指定資料庫路徑'); return }
@@ -284,10 +289,11 @@ export default function Dashboard() {
   // All per-state derivations in one memo — recomputed only when `state` changes,
   // not on every unrelated re-render (tab switch, blur toggle, dialog open). Must sit
   // above the early return to satisfy the rules of hooks.
-  const DEVIATION_THRESHOLD = 5
   const derived = useMemo(() => {
     if (!state) return null
+    const devThreshold = state.retirement.rebalance_threshold_pct ?? 5
     const total = totalAssetsTwd(state)
+    const byCurrency = assetsByCurrency(state)
     const cats = categorySummaries(state)
     const { birth_year, retirement_age, target_amount_twd, monthly_contribution_wan } = state.retirement
     const target_year = birth_year + retirement_age
@@ -295,10 +301,12 @@ export default function Dashboard() {
     return {
       total,
       totalUsd: total / state.exchange_rate,
+      byCurrency,
       cats,
       rebalance: rebalanceRows(state),
+      devThreshold,
       deviatingBuckets: cats.filter(
-        c => c.target_pct > 0 && Math.abs(c.actual_pct - c.target_pct) >= DEVIATION_THRESHOLD,
+        c => c.target_pct > 0 && Math.abs(c.actual_pct - c.target_pct) >= devThreshold,
       ),
       target_year,
       progress: total / target_amount_twd,
@@ -326,7 +334,7 @@ export default function Dashboard() {
   if (!state) return <div className="flex items-center justify-center h-screen text-muted-foreground">載入中…</div>
 
   const {
-    total, totalUsd, cats, rebalance, deviatingBuckets,
+    total, totalUsd, byCurrency, cats, rebalance, deviatingBuckets, devThreshold,
     target_year, progress, remaining, yearsLeft, reqReturn, barData,
   } = derived!
   const { retirement_age, target_amount_twd } = state.retirement
@@ -402,7 +410,7 @@ export default function Dashboard() {
           <AlertTriangle size={16} className="text-amber-500 mt-0.5 flex-shrink-0" />
           <div className="flex-1 min-w-0">
             <p className="text-sm font-medium text-amber-800 dark:text-amber-300">
-              再平衡提醒：{deviatingBuckets.length} 個桶子偏離目標超過 {DEVIATION_THRESHOLD}%
+              再平衡提醒：{deviatingBuckets.length} 個桶子偏離目標超過 {devThreshold}%
             </p>
             <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5">
               {deviatingBuckets.map(c => {
@@ -434,14 +442,15 @@ export default function Dashboard() {
       )}
 
       {/* Overview Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
         <Card>
-          <CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">總資產 (TWD)</CardTitle></CardHeader>
-          <CardContent><p className="text-2xl font-bold"><A>{fmtWan(total)}</A></p></CardContent>
-        </Card>
-        <Card>
-          <CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">總資產 (USD)</CardTitle></CardHeader>
-          <CardContent><p className="text-2xl font-bold"><A>${fmt(totalUsd)}</A></p></CardContent>
+          <CardHeader className="pb-1"><CardTitle className="text-sm text-muted-foreground">總資產 台幣(美金)</CardTitle></CardHeader>
+          <CardContent>
+            <p className="text-2xl font-bold"><A>{fmtWan(total)} <span className="text-lg text-muted-foreground">(${fmt(totalUsd)})</span></A></p>
+            <p className="text-xs text-muted-foreground mt-1">
+              <A>台幣資產 {fmtWan(byCurrency.twd)} · 美元資產 ${fmt(byCurrency.usd)}</A>
+            </p>
+          </CardContent>
         </Card>
         <Card>
           <CardHeader className="pb-1">
@@ -621,7 +630,7 @@ export default function Dashboard() {
 
         {/* ── Tab 5: 再平衡 ── */}
         <TabsContent value="rebalance" className="space-y-4">
-          <RebalanceAssistant state={state} blurred={blurred} />
+          <RebalanceAssistant state={state} blurred={blurred} onThresholdChange={handleThresholdChange} />
           {(() => {
             const fx = state.exchange_rate
             const isTWD = rebalanceCcy === 'TWD'

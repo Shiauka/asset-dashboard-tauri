@@ -89,7 +89,7 @@ export default function HistoryChart({ snapshots, blurred = false, holdings, cas
   }
 
   const btn = (active: boolean) =>
-    `px-3 py-1 text-sm rounded-md border transition-colors ${active ? 'bg-slate-800 text-white border-slate-800' : 'border-input hover:bg-muted'}`
+    `px-3 py-1 text-sm rounded-md border transition-colors ${active ? 'bg-[#E87930] text-white border-[#E87930]' : 'border-input hover:bg-muted'}`
 
   return (
     <div className="space-y-3">

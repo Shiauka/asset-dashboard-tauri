@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -12,10 +12,24 @@ import { computeNewMoneyAllocation, totalAssetsTwd } from '@/lib/calc'
 const fmt = (n: number, d = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n)
 
-export default function RebalanceAssistant({ state, blurred }: { state: AppState; blurred: boolean }) {
+export default function RebalanceAssistant({ state, blurred, onThresholdChange }: {
+  state: AppState
+  blurred: boolean
+  onThresholdChange: (pct: number) => void
+}) {
   const [amount, setAmount]     = useState('')
   const [currency, setCurrency] = useState<'TWD' | 'USD'>('TWD')
   const [submitted, setSubmitted] = useState(false)
+
+  // 偏離警示門檻：本地字串狀態讓輸入流暢，輸入合法時才寫回 state。
+  const committedThreshold = state.retirement.rebalance_threshold_pct ?? 5
+  const [thresholdStr, setThresholdStr] = useState(String(committedThreshold))
+  useEffect(() => { setThresholdStr(String(committedThreshold)) }, [committedThreshold])
+  const handleThreshold = (v: string) => {
+    setThresholdStr(v)
+    const n = parseFloat(v)
+    if (isFinite(n) && n > 0 && n <= 50) onThresholdChange(n)
+  }
 
   const B = ({ children }: { children: React.ReactNode }) =>
     blurred ? <span className="blur-sm select-none">{children}</span> : <>{children}</>
@@ -49,6 +63,19 @@ export default function RebalanceAssistant({ state, blurred }: { state: AppState
         <p className="text-xs text-muted-foreground">
           輸入本次要投入的金額，自動計算補足各桶缺口的最佳分配——只買不賣，以大桶偏離為優先：整體桶位已達標則跳過桶內個股，優先補足偏離最大的欠配桶。
         </p>
+        <div className="flex items-center gap-2 mt-3">
+          <span className="text-xs text-muted-foreground whitespace-nowrap">偏離警示門檻</span>
+          <Input
+            type="number"
+            min={0.5}
+            max={50}
+            step={0.5}
+            value={thresholdStr}
+            onChange={e => handleThreshold(e.target.value)}
+            className="w-20 h-7"
+          />
+          <span className="text-xs text-muted-foreground">% — 任一桶偏離目標超過此幅度，首頁就跳再平衡提醒</span>
+        </div>
       </CardHeader>
       <CardContent className="space-y-4">
 

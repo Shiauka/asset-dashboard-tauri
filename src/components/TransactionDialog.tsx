@@ -218,8 +218,9 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
     (isNewCash && !!newBankName) ||
     (isTransfer && !!transferFrom && !!transferTo && transferFrom !== transferTo && !!transferAmount && (!isCrossCurrency || !!transferAmountTo))
 
-  // Active button style uses explicit slate-800 to avoid CSS-var resolution issues in Tailwind v4
-  const activeBtn = 'bg-slate-800 text-white border-slate-800'
+  // Active button uses explicit brand orange (#E87930) to avoid CSS-var resolution issues in Tailwind v4
+  // 選取態用品牌橘，與深色 modal 底（#1a1a2e）拉開對比，避免選取/未選取難分辨
+  const activeBtn = 'bg-[#E87930] text-white border-[#E87930]'
   const inactiveBtn = 'border-input bg-background hover:bg-muted text-foreground'
 
   return (
@@ -253,7 +254,7 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
               className={`rounded-md py-2 text-sm font-medium border transition-colors ${
                 isNewPos
                   ? 'bg-emerald-600 text-white border-emerald-600'
-                  : 'border-dashed border-emerald-500 text-emerald-700 hover:bg-emerald-50'
+                  : 'border-dashed border-emerald-500 text-emerald-400 hover:bg-emerald-500/10'
               }`}
             >
               + 建立股票
@@ -263,7 +264,7 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
               className={`rounded-md py-2 text-sm font-medium border transition-colors ${
                 isTransfer
                   ? 'bg-amber-500 text-white border-amber-500'
-                  : 'border-dashed border-amber-400 text-amber-700 hover:bg-amber-50'
+                  : 'border-dashed border-amber-400 text-amber-400 hover:bg-amber-500/10'
               }`}
             >
               帳戶轉帳
@@ -273,7 +274,7 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
               className={`rounded-md py-2 text-sm font-medium border transition-colors ${
                 isNewCash
                   ? 'bg-indigo-600 text-white border-indigo-600'
-                  : 'border-dashed border-indigo-400 text-indigo-600 hover:bg-indigo-50'
+                  : 'border-dashed border-indigo-400 text-indigo-400 hover:bg-indigo-500/10'
               }`}
             >
               + 建立現金
