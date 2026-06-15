@@ -16,7 +16,7 @@ interface Props {
   onSave: (s: RetirementSettings) => void
 }
 
-function Row({ label, sublabel, children }: { label: string; sublabel?: string; children: React.ReactNode }) {
+function Row({ label, sublabel, children }: { label: React.ReactNode; sublabel?: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-3 gap-2 items-center">
       <Label className="text-right leading-tight">
@@ -34,6 +34,7 @@ export default function RetirementDialog({ open, onClose, current, currentTotal,
   const [amountWan,      setAmountWan]      = useState(String(current.target_amount_twd / 10000))
   const [monthlyWan,     setMonthlyWan]     = useState(String(current.monthly_contribution_wan))
   const [expectedReturn, setExpectedReturn] = useState(String(+(current.expected_annual_return * 100).toFixed(2)))
+  const [showReturnHint, setShowReturnHint] = useState(false)
 
   useEffect(() => {
     if (open) {
@@ -126,13 +127,36 @@ export default function RetirementDialog({ open, onClose, current, currentTotal,
             </div>
           </Row>
 
-          <Row label="預期年化報酬" sublabel="%">
+          <Row
+            label={
+              <span className="inline-flex items-center justify-end gap-1">
+                預期年化報酬
+                <button
+                  type="button"
+                  onClick={() => setShowReturnHint(v => !v)}
+                  aria-label="混合報酬率說明"
+                  aria-expanded={showReturnHint}
+                  className={`leading-none transition-colors hover:text-foreground ${showReturnHint ? 'text-foreground' : 'text-muted-foreground'}`}
+                >
+                  ⓘ
+                </button>
+              </span>
+            }
+            sublabel="%"
+          >
             <div className="flex items-center gap-2">
               <Input type="number" min={0} max={30} step={0.5} placeholder="如 7"
                 value={expectedReturn} onChange={e => setExpectedReturn(e.target.value)} />
               <span className="text-sm text-muted-foreground whitespace-nowrap">%</span>
             </div>
           </Row>
+
+          {showReturnHint && (
+            <div className="-mt-2 rounded-lg bg-muted/50 px-3 py-2 text-xs text-muted-foreground leading-snug">
+              填「整個組合」的混合報酬率，不是純股票報酬率。<br />
+              依各部位加權估算，例如現金 30% 抓 1%、股票 70% 抓 7%，混合約 5.2%。
+            </div>
+          )}
 
           {canSave && (
             <div className="rounded-lg bg-muted p-3 space-y-1.5 text-sm">

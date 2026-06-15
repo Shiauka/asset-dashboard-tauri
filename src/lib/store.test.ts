@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { loadState, saveState } from './store'
+import { DEFAULT_CATEGORIES } from './calc'
 
 // store.ts 用全域 window + localStorage；node 環境手動 polyfill（in-memory）
 const KEY = 'asset_dashboard_v1'
@@ -89,9 +90,39 @@ describe('saveState / loadState — 備份還原無損', () => {
       transactions: [{ id: 't1', date: '2025-01-01', type: 'buy' as const, symbol: 'VOO', shares: 10, price: 480, currency: 'USD' as const, amount: 4800 }],
       snapshots: [{ date: '2025-01-01', total_twd: 1000000, bucket_pct: { core: 100 } }],
       retirement: { target_amount_twd: 20000000, monthly_contribution_wan: 5, expected_annual_return: 0.07, birth_year: 1990, retirement_age: 52 },
+      categories: DEFAULT_CATEGORIES,
     }
     saveState(full)
     expect(loadState()).toEqual(full)
+  })
+
+  it('舊存檔沒帶 categories → loadState 補上預設五桶，持倉不消失', () => {
+    setLS({
+      exchange_rate: 32,
+      holdings: [{ symbol: 'VOO', name: 'v', currency: 'USD', category: 'core', shares: 10, price: 480, target_pct: 15 }],
+      cash_accounts: [],
+      transactions: [],
+      snapshots: [],
+      retirement: { target_amount_twd: 2e7, monthly_contribution_wan: 5, expected_annual_return: 0.07, birth_year: 1990, retirement_age: 52 },
+    })
+    const s = loadState()
+    expect(s.categories).toEqual(DEFAULT_CATEGORIES)
+    expect(s.holdings).toHaveLength(1)   // 舊資料不因遷移而遺失
+  })
+
+  it('孤兒持倉（分類 id 不存在）→ loadState 自動歸到現金桶，市值不消失', () => {
+    setLS({
+      exchange_rate: 32,
+      holdings: [{ symbol: 'VOO', name: 'v', currency: 'USD', category: 'ghost', shares: 10, price: 480, target_pct: 15 }],
+      cash_accounts: [],
+      transactions: [],
+      snapshots: [],
+      retirement: { target_amount_twd: 2e7, monthly_contribution_wan: 5, expected_annual_return: 0.07, birth_year: 1990, retirement_age: 52 },
+      categories: DEFAULT_CATEGORIES,
+    })
+    const s = loadState()
+    expect(s.holdings).toHaveLength(1)
+    expect(s.holdings[0].category).toBe('defensive')   // 歸到現金桶（is_cash）
   })
 
   it('舊格式 load → save → load 收斂（第二次 load 與第一次相同）', () => {

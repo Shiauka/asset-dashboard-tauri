@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Plus, RefreshCw, Settings, Eye, EyeOff, Download, Upload, RotateCcw, Trash2, FolderOpen, Pencil, AlertTriangle, PlayCircle } from 'lucide-react'
+import { Plus, RefreshCw, Settings, Eye, EyeOff, Download, Upload, RotateCcw, Trash2, FolderOpen, Pencil, AlertTriangle, PlayCircle, Layers } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +11,7 @@ import {
 import { invoke } from '@tauri-apps/api/core'
 import { loadState, saveState, resetState, clearState, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
 import { getTaiwanToday } from '@/lib/dateUtils'
-import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct } from '@/lib/calc'
+import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct, getCategories } from '@/lib/calc'
 import { INITIAL_STATE } from '@/lib/initialData'
 import { DEMO_STATE } from '@/lib/demoData'
 import type { AppState, Transaction, TxType, Category, RetirementSettings } from '@/lib/types'
@@ -26,6 +26,7 @@ import TwrPanel from './TwrPanel'
 import RetirementProgressPanel from './RetirementProgressPanel'
 import RebalanceAssistant from './RebalanceAssistant'
 import ChannelInfoDialog from './ChannelInfoDialog'
+import CategorySettingsDialog from './CategorySettingsDialog'
 
 const fmt = (n: number, digits = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n)
@@ -43,6 +44,7 @@ export default function Dashboard() {
   const [editingTx, setEditingTx] = useState<Transaction | null>(null)
   const [dbOpen, setDbOpen] = useState(false)
   const [channelOpen, setChannelOpen] = useState(false)
+  const [categoryOpen, setCategoryOpen] = useState(false)
   const [dbRootDir, setDbRootDir] = useState<string | null>(null)
   const [rebalanceCcy, setRebalanceCcy] = useState<'all' | 'TWD' | 'USD'>('all')
   const importRef = useRef<HTMLInputElement>(null)
@@ -295,6 +297,8 @@ export default function Dashboard() {
     const total = totalAssetsTwd(state)
     const byCurrency = assetsByCurrency(state)
     const cats = categorySummaries(state)
+    // 總覽只顯示「有市值或有設目標」的桶；純空桶（剛新增、還沒放東西）不顯示，與持倉桶視圖一致。
+    const visibleCats = cats.filter(c => c.value_twd > 0 || c.target_pct > 0)
     const { birth_year, retirement_age, target_amount_twd, monthly_contribution_wan } = state.retirement
     const target_year = birth_year + retirement_age
     const yearsLeft = target_year - new Date().getFullYear()
@@ -303,6 +307,7 @@ export default function Dashboard() {
       totalUsd: total / state.exchange_rate,
       byCurrency,
       cats,
+      visibleCats,
       rebalance: rebalanceRows(state),
       devThreshold,
       deviatingBuckets: cats.filter(
@@ -313,7 +318,7 @@ export default function Dashboard() {
       remaining: target_amount_twd - total,
       yearsLeft,
       reqReturn: requiredAnnualReturn(total, target_amount_twd, yearsLeft, monthly_contribution_wan * 10000 * 12),
-      barData: cats.map(c => ({ name: c.name, 實際: parseFloat(c.actual_pct.toFixed(2)), 目標: c.target_pct })),
+      barData: visibleCats.map(c => ({ name: c.name, 實際: parseFloat(c.actual_pct.toFixed(2)), 目標: c.target_pct })),
     }
   }, [state])
 
@@ -334,7 +339,7 @@ export default function Dashboard() {
   if (!state) return <div className="flex items-center justify-center h-screen text-muted-foreground">載入中…</div>
 
   const {
-    total, totalUsd, byCurrency, cats, rebalance, deviatingBuckets, devThreshold,
+    total, totalUsd, byCurrency, cats, visibleCats, rebalance, deviatingBuckets, devThreshold,
     target_year, progress, remaining, yearsLeft, reqReturn, barData,
   } = derived!
   const { retirement_age, target_amount_twd } = state.retirement
@@ -345,7 +350,12 @@ export default function Dashboard() {
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">資產管理儀表板</h1>
+          <div className="flex items-center gap-2">
+            <h1 className="text-2xl font-bold tracking-tight">資產管理儀表板</h1>
+            <span className="rounded-full bg-muted text-muted-foreground text-xs font-medium px-2 py-0.5 leading-none">
+              v{__APP_VERSION__}
+            </span>
+          </div>
           <p className="text-sm text-muted-foreground">
             1 USD = <A>{fmt(state.exchange_rate, 2)}</A> TWD · 本機儲存 · 隱私優先
           </p>
@@ -359,6 +369,9 @@ export default function Dashboard() {
           </Button>
           <Button size="sm" variant="outline" onClick={() => setRetirementOpen(true)}>
             <Settings size={14} className="mr-1" />目標設定
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setCategoryOpen(true)} title="資產桶設定（新增／刪除／改名／排序）">
+            <Layers size={14} className="mr-1" />資產桶設定
           </Button>
           <Button size="sm" variant="outline" onClick={() => setDbOpen(true)}
             title={dbRootDir ? `根目錄：${dbRootDir}` : '根目錄設定（未設定）'}
@@ -504,13 +517,13 @@ export default function Dashboard() {
                 {!drillCat ? (
                   <ResponsiveContainer width="100%" height={300}>
                     <PieChart>
-                      <Pie data={cats} dataKey="value_twd" nameKey="name" cx="50%" cy="50%"
+                      <Pie data={visibleCats} dataKey="value_twd" nameKey="name" cx="50%" cy="50%"
                         outerRadius={105} cursor="pointer"
-                        onClick={(_, idx) => setDrillCat(cats[idx].key)}
+                        onClick={(_, idx) => setDrillCat(visibleCats[idx].key)}
                         label={({ name, payload }: { name?: string; payload?: { actual_pct: number } }) =>
                           `${name ?? ''} ${payload?.actual_pct?.toFixed(1) ?? ''}%`}
                         labelLine>
-                        {cats.map(c => <Cell key={c.key} fill={c.color} stroke="none" />)}
+                        {visibleCats.map(c => <Cell key={c.key} fill={c.color} stroke="none" />)}
                       </Pie>
                       <Tooltip formatter={(v) => [blurred ? '***' : `${fmtWan(Number(v))}`, '市值']} />
                     </PieChart>
@@ -567,7 +580,7 @@ export default function Dashboard() {
                     <Tooltip formatter={(v) => `${Number(v).toFixed(1)}%`} />
                     <Bar dataKey="目標" fill="#94a3b8" radius={[0, 3, 3, 0]} />
                     <Bar dataKey="實際" fill="#60a5fa" radius={[0, 3, 3, 0]}>
-                      {barData.map((_, i) => <Cell key={i} fill={cats[i].color} />)}
+                      {barData.map((_, i) => <Cell key={i} fill={visibleCats[i].color} />)}
                     </Bar>
                   </BarChart>
                 </ResponsiveContainer>
@@ -583,7 +596,7 @@ export default function Dashboard() {
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 mt-4">
-                  {cats.map(c => (
+                  {visibleCats.map(c => (
                     <button key={c.key} onClick={() => setDrillCat(c.key)}
                       className="text-left rounded-lg border p-3 hover:shadow-md transition-shadow cursor-pointer"
                       style={{ borderLeftWidth: 4, borderLeftColor: c.color }}>
@@ -613,6 +626,7 @@ export default function Dashboard() {
                 blurred={blurred}
                 holdings={state.holdings}
                 cashAccounts={state.cash_accounts}
+                categories={getCategories(state)}
               />
             </CardContent>
           </Card>
@@ -904,12 +918,19 @@ export default function Dashboard() {
       </Tabs>
 
       <ChannelInfoDialog open={channelOpen} onClose={() => setChannelOpen(false)} />
+      <CategorySettingsDialog
+        open={categoryOpen}
+        onClose={() => setCategoryOpen(false)}
+        state={state}
+        onUpdate={commit}
+      />
       <TransactionDialog
         open={txOpen}
         onClose={() => setTxOpen(false)}
         onSubmit={handleTransaction}
         holdings={state.holdings}
         cashAccounts={state.cash_accounts}
+        categories={getCategories(state)}
       />
       <RetirementDialog
         open={retirementOpen}

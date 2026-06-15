@@ -4,20 +4,18 @@ import { useState, useMemo } from 'react'
 import {
   ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from 'recharts'
-import type { DailySnapshot, Category, Holding, CashAccount } from '@/lib/types'
-import { CATEGORY_META } from '@/lib/calc'
+import type { DailySnapshot, Holding, CashAccount, CategoryDef } from '@/lib/types'
 
 interface Props {
   snapshots: DailySnapshot[]
   blurred?: boolean
   holdings: Holding[]
   cashAccounts: CashAccount[]
+  categories: CategoryDef[]
 }
 
 type Period = 'daily' | 'weekly' | 'monthly'
 type ViewMode = 'total' | 'bucket' | 'holding'
-
-const BUCKET_KEYS: Category[] = ['core', 'aggressive', 'global', 'alternative', 'defensive']
 
 function isoWeekKey(date: string): string {
   const d = new Date(date)
@@ -42,10 +40,13 @@ const fmtWan = (n: number) =>
 const fmtPct = (n: number) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(n)
 
-export default function HistoryChart({ snapshots, blurred = false, holdings, cashAccounts }: Props) {
+export default function HistoryChart({ snapshots, blurred = false, holdings, cashAccounts, categories }: Props) {
   const [period, setPeriod] = useState<Period>('daily')
   const [viewMode, setViewMode] = useState<ViewMode>('total')
   const [selectedSymbol, setSelectedSymbol] = useState<string>('')
+
+  const catMetaMap = useMemo(() => new Map(categories.map(c => [c.id, c])), [categories])
+  const bucketKeys = useMemo(() => categories.map(c => c.id), [categories])
 
   const allItems = [
     ...holdings.map(h => ({ id: h.symbol, label: `${h.symbol}　${h.name}` })),
@@ -62,11 +63,11 @@ export default function HistoryChart({ snapshots, blurred = false, holdings, cas
     }
     if (viewMode === 'bucket') {
       const row: Record<string, string | number | null> = { date: s.date, label }
-      for (const key of BUCKET_KEYS) row[key] = s.bucket_pct?.[key] ?? null
+      for (const key of bucketKeys) row[key] = s.bucket_pct?.[key] ?? null
       return row
     }
     return { date: s.date, label, value: s.holdings_twd?.[activeSymbol] ?? null, shares: s.holdings_shares?.[activeSymbol] ?? null }
-  }), [agg, period, viewMode, activeSymbol])
+  }), [agg, period, viewMode, activeSymbol, bucketKeys])
 
   const PERIODS: { key: Period; label: string }[] = [
     { key: 'daily', label: '每日' },
@@ -147,7 +148,7 @@ export default function HistoryChart({ snapshots, blurred = false, holdings, cas
               formatter={(v, name, item) => {
                 if (v === null || v === undefined) return ['—', name]
                 if (viewMode === 'bucket') {
-                  return [`${fmtPct(Number(v))}%`, CATEGORY_META[name as Category]?.name ?? name]
+                  return [`${fmtPct(Number(v))}%`, catMetaMap.get(String(name))?.name ?? name]
                 }
                 if (viewMode === 'holding') {
                   const shares = (item as { payload?: { shares?: number | null } }).payload?.shares
@@ -159,16 +160,16 @@ export default function HistoryChart({ snapshots, blurred = false, holdings, cas
               labelFormatter={label => `日期：${label}`}
             />
             {viewMode === 'bucket' && (
-              <Legend formatter={v => CATEGORY_META[v as Category]?.name ?? v} />
+              <Legend formatter={v => catMetaMap.get(String(v))?.name ?? v} />
             )}
 
             {viewMode === 'total' && (
               <Line type="monotone" dataKey="total" stroke="#3b82f6" strokeWidth={2}
                 dot={data.length < 60} connectNulls />
             )}
-            {viewMode === 'bucket' && BUCKET_KEYS.map(key => (
+            {viewMode === 'bucket' && bucketKeys.map(key => (
               <Line key={key} type="monotone" dataKey={key}
-                stroke={CATEGORY_META[key].color} strokeWidth={2}
+                stroke={catMetaMap.get(key)?.color ?? '#9ca3af'} strokeWidth={2}
                 dot={data.length < 60} connectNulls />
             ))}
             {viewMode === 'holding' && (

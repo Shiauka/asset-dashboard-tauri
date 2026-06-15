@@ -1,7 +1,7 @@
 import { INITIAL_STATE } from './initialData'
-import type { AppState, Holding, CashAccount, Transaction, Category, RetirementSettings } from './types'
+import type { AppState, Holding, CashAccount, Transaction, Category, CategoryDef, RetirementSettings } from './types'
 import { getTaiwanToday } from './dateUtils'
-import { categorySummaries, holdingValueTwd } from './calc'
+import { categorySummaries, holdingValueTwd, DEFAULT_CATEGORIES, getCategories } from './calc'
 
 const KEY = 'asset_dashboard_v1'
 
@@ -34,10 +34,21 @@ export function loadState(): AppState {
         retirement_age:          ((r.target_year as number) ?? 2040) - 1990,
       }
 
+  // 舊存檔沒帶 categories → 補上預設五桶，畫面與數字維持不變。
+  const categories = parsed.categories?.length ? parsed.categories : DEFAULT_CATEGORIES
+  // 孤兒持倉防呆：若持倉的桶 id 不在桶清單裡（只可能來自竄改/匯入/sync 漂移），
+  // 自動歸到現金桶，避免市值從總覽默默消失（圓餅加總≠總資產）。正常操作不會觸發。
+  const validCatIds = new Set(categories.map(c => c.id))
+  const cashId = categories.find(c => c.is_cash)?.id
+    ?? (validCatIds.has('defensive') ? 'defensive' : categories[0]?.id ?? 'defensive')
+  const holdings = (parsed.holdings ?? []).map(h =>
+    validCatIds.has(h.category) ? h : { ...h, category: cashId },
+  )
+
   return {
     ...(parsed as AppState),
     exchange_rate: parsed.exchange_rate ?? INITIAL_STATE.exchange_rate,
-    holdings:      parsed.holdings ?? [],
+    holdings,
     transactions:  parsed.transactions ?? [],
     retirement:    migratedRetirement,
     snapshots:     parsed.snapshots ?? [],
@@ -45,6 +56,7 @@ export function loadState(): AppState {
       ...c,
       target_pct: c.target_pct ?? 0,
     })),
+    categories,
   }
 }
 
@@ -68,6 +80,7 @@ export function clearState(): AppState {
     transactions: [],
     snapshots: [],
     retirement: INITIAL_STATE.retirement,
+    categories: DEFAULT_CATEGORIES,
   }
   localStorage.setItem(KEY, JSON.stringify(empty))
   return empty
@@ -179,6 +192,65 @@ export function deleteHolding(state: AppState, symbol: string): AppState {
 
 export function deleteCashAccount(state: AppState, id: string): AppState {
   return { ...state, cash_accounts: state.cash_accounts.filter(c => c.id !== id) }
+}
+
+// ── 分類（桶）管理 ──────────────────────────────────────────────────────────
+// 改某持倉的分類（move bucket）。
+export function setHoldingCategory(state: AppState, symbol: string, category: Category): AppState {
+  return { ...state, holdings: state.holdings.map(h => h.symbol === symbol ? { ...h, category } : h) }
+}
+
+const CATEGORY_PALETTE_POOL = [
+  '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#6366f1',
+  '#ec4899', '#14b8a6', '#8b5cf6', '#f97316', '#0ea5e9',
+]
+
+// 新增一個分類（非現金桶）。id 自動產生且不再變動。
+export function addCategory(state: AppState): AppState {
+  const cats = getCategories(state)
+  const id = `cat_${Date.now()}`
+  const order = cats.reduce((m, c) => Math.max(m, c.order), -1) + 1
+  const color = CATEGORY_PALETTE_POOL[cats.length % CATEGORY_PALETTE_POOL.length]
+  const def: CategoryDef = { id, name: '新桶', color, target_pct: 0, order, palette: [color] }
+  return { ...state, categories: [...cats, def] }
+}
+
+// 改名/改色/改目標%（id 與 is_cash 不開放改，避免動到現金桶歸屬）。
+export function updateCategory(state: AppState, id: string, patch: Partial<CategoryDef>): AppState {
+  const { id: _id, is_cash: _isCash, ...rest } = patch
+  const cats = getCategories(state).map(c => {
+    if (c.id !== id) return c
+    const merged: CategoryDef = { ...c, ...rest }
+    if (rest.color) merged.palette = [rest.color]   // drill-down 配色跟著主色走
+    return merged
+  })
+  return { ...state, categories: cats }
+}
+
+// 是否可刪：現金桶不可刪、仍有持倉的桶不可刪。
+export function canDeleteCategory(state: AppState, id: string): { ok: boolean; reason?: string } {
+  const def = getCategories(state).find(c => c.id === id)
+  if (!def) return { ok: false, reason: '桶不存在' }
+  if (def.is_cash) return { ok: false, reason: '現金桶不可刪除' }
+  const count = state.holdings.filter(h => h.category === id).length
+  if (count > 0) return { ok: false, reason: `還有 ${count} 個持倉在此桶，請先移走或刪除` }
+  return { ok: true }
+}
+
+export function deleteCategory(state: AppState, id: string): AppState {
+  if (!canDeleteCategory(state, id).ok) return state
+  return { ...state, categories: getCategories(state).filter(c => c.id !== id) }
+}
+
+// 上/下移一格（dir = -1 上移、+1 下移），並重排 order。
+export function moveCategory(state: AppState, id: string, dir: -1 | 1): AppState {
+  const cats = getCategories(state)   // 已依 order 排序
+  const idx = cats.findIndex(c => c.id === id)
+  const swap = idx + dir
+  if (idx < 0 || swap < 0 || swap >= cats.length) return state
+  const reordered = [...cats]
+  ;[reordered[idx], reordered[swap]] = [reordered[swap], reordered[idx]]
+  return { ...state, categories: reordered.map((c, i) => ({ ...c, order: i })) }
 }
 
 // 刪除交易紀錄並還原其對持倉/帳戶的影響

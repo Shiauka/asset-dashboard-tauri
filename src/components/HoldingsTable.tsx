@@ -6,10 +6,10 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AppState, Category, Currency } from '@/lib/types'
-import { holdingValueTwd, CATEGORY_META } from '@/lib/calc'
+import { holdingValueTwd, getCategories } from '@/lib/calc'
 import {
   updateHoldingPrice, updateHoldingTargetPct, updateCashAccountTargetPct,
-  deleteHolding, deleteCashAccount,
+  deleteHolding, deleteCashAccount, setHoldingCategory,
 } from '@/lib/store'
 
 const fmt = (n: number, d = 0) =>
@@ -23,18 +23,20 @@ interface Props {
 
 const COL = {
   symbol: 'w-[68px] shrink-0',
-  name:   'w-[120px] shrink-0',
+  name:   'w-[104px] shrink-0',
   shares: 'w-[88px] shrink-0 text-right',
   price:  'w-[80px] shrink-0 text-right',
   ccy:    'w-[40px] shrink-0 text-center',
   target: 'w-[54px] shrink-0 text-right',
   value:  'w-[92px] shrink-0 text-right',
+  cat:    'w-[34px] shrink-0 flex justify-center',
   del:    'w-[28px] shrink-0 flex justify-end',
 }
 
 type HoldingField = 'price' | 'target_pct'
 type EditingState =
   | { kind: 'holding'; symbol: string; field: HoldingField }
+  | { kind: 'holding-cat'; symbol: string }
   | { kind: 'cash'; id: string }
 type ViewMode = 'bucket' | 'account'
 
@@ -43,15 +45,14 @@ const CCY_META: Record<Currency, { label: string; color: string }> = {
   USD: { label: '美金帳戶', color: '#16A34A' },
 }
 
-function SectionHeader({ cat, total, targetPct, amtClass = '' }: { cat: Category; total: number; targetPct: number; amtClass?: string }) {
-  const meta = CATEGORY_META[cat]
+function SectionHeader({ name, color, total, targetPct, amtClass = '' }: { name: string; color: string; total: number; targetPct: number; amtClass?: string }) {
   return (
     <div
       className="flex items-center justify-between px-4 py-2.5 rounded-t-lg"
-      style={{ borderLeft: `4px solid ${meta.color}`, background: `${meta.color}12` }}
+      style={{ borderLeft: `4px solid ${color}`, background: `${color}12` }}
     >
       <div className="flex items-center gap-2">
-        <span className="text-sm font-semibold" style={{ color: meta.color }}>{meta.name}</span>
+        <span className="text-sm font-semibold" style={{ color }}>{name}</span>
         {targetPct > 0 && (
           <span className="text-xs text-muted-foreground font-medium">目標 {targetPct}%</span>
         )}
@@ -71,6 +72,7 @@ function ColHeaders({ sharesNode, valueLabel }: { sharesNode?: React.ReactNode; 
       <span className={COL.ccy}>幣</span>
       <span className={COL.target}>目標%</span>
       <span className={COL.value}>{valueLabel ?? '市值'}</span>
+      <span className={`${COL.cat} block text-center`}>桶</span>
       <span className={COL.del} />
     </div>
   )
@@ -81,6 +83,11 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
   const [editVal, setEditVal] = useState('')
   const [viewMode, setViewMode] = useState<ViewMode>('bucket')
   const fx = state.exchange_rate
+
+  const cats = getCategories(state)
+  const catMap = new Map(cats.map(c => [c.id, c]))
+  const cashCat = cats.find(c => c.is_cash) ?? catMap.get('defensive')
+  const cashId = cashCat?.id ?? 'defensive'
 
   const startEdit = (symbol: string, field: HoldingField, current: number) => {
     setEditing({ kind: 'holding', symbol, field })
@@ -114,6 +121,9 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
 
   const isCashEditing = (id: string) =>
     editing?.kind === 'cash' && editing.id === id
+
+  const isCatEditing = (symbol: string) =>
+    editing?.kind === 'holding-cat' && editing.symbol === symbol
 
   const handleDeleteHolding = (symbol: string, name: string) => {
     if (!confirm(`確定刪除「${name}」(${symbol}) 的部位？此操作無法還原。`)) return
@@ -183,6 +193,26 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
       <span className={`${COL.value} tabular-nums text-xs font-semibold ${amtClass}`}>
         {valueCellFn(h)}
       </span>
+      <span className={`${COL.cat} relative`}>
+        {isCatEditing(h.symbol) ? (
+          <select
+            autoFocus
+            value={h.category}
+            onChange={e => { onUpdate(setHoldingCategory(state, h.symbol, e.target.value)); setEditing(null) }}
+            onBlur={() => setEditing(null)}
+            className="absolute right-0 top-1/2 -translate-y-1/2 z-20 h-6 w-[120px] text-xs border rounded bg-background"
+          >
+            {cats.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        ) : (
+          <button
+            onClick={() => setEditing({ kind: 'holding-cat', symbol: h.symbol })}
+            title={`桶：${catMap.get(h.category)?.name ?? h.category}（點擊修改）`}
+            className="w-3.5 h-3.5 rounded-full border border-black/10 hover:ring-2 hover:ring-offset-1 hover:ring-muted-foreground/30"
+            style={{ background: catMap.get(h.category)?.color ?? '#9ca3af' }}
+          />
+        )}
+      </span>
       <span className={COL.del}>
         <button onClick={() => handleDeleteHolding(h.symbol, h.name)}
           className="text-muted-foreground/40 hover:text-red-500 transition-colors" title="刪除">
@@ -230,6 +260,7 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
       <span className={`${COL.value} tabular-nums text-xs font-semibold text-emerald-600 ${amtClass}`}>
         {valueCellFn(c)}
       </span>
+      <span className={COL.cat} />
       <span className={COL.del}>
         <button onClick={() => handleDeleteCash(c.id, c.bank)}
           className="text-muted-foreground/40 hover:text-red-500 transition-colors" title="刪除">
@@ -241,18 +272,18 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
 
   // ── Bucket view ──────────────────────────────────────────────────────────
 
-  const grouped = state.holdings.reduce<Record<Category, typeof state.holdings>>((acc, h) => {
+  const grouped = state.holdings.reduce<Record<string, typeof state.holdings>>((acc, h) => {
     acc[h.category] = [...(acc[h.category] || []), h]
     return acc
-  }, {} as Record<Category, typeof state.holdings>)
+  }, {})
 
   const renderBucketView = () => (
     <>
-      {/* 股票持倉（非防禦） */}
-      {(Object.keys(CATEGORY_META) as Category[])
-        .filter(k => k !== 'defensive')
-        .map(cat => {
-          const items = (grouped[cat] || []).slice().sort((a, b) =>
+      {/* 一般資產桶（非現金桶）；空桶自動不顯示 */}
+      {cats
+        .filter(c => c.id !== cashId)
+        .map(c => {
+          const items = (grouped[c.id] || []).slice().sort((a, b) =>
             holdingValueTwd(b.shares, b.price, b.currency, fx) - holdingValueTwd(a.shares, a.price, a.currency, fx)
           )
           if (items.length === 0) return null
@@ -260,8 +291,8 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
           const catTargetPct = items.reduce((s, h) => s + h.target_pct, 0)
 
           return (
-            <div key={cat} className="rounded-lg border overflow-hidden">
-              <SectionHeader cat={cat} total={catTotal} targetPct={catTargetPct} amtClass={amtClass} />
+            <div key={c.id} className="rounded-lg border overflow-hidden">
+              <SectionHeader name={c.name} color={c.color} total={catTotal} targetPct={catTargetPct} amtClass={amtClass} />
               <ColHeaders />
               {items.map((h, idx) => {
                 const val = holdingValueTwd(h.shares, h.price, h.currency, fx)
@@ -271,9 +302,9 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
           )
         })}
 
-      {/* 防禦資產 */}
+      {/* 現金桶（收納現金帳戶 + 該桶持倉） */}
       {(() => {
-        const defHoldings = state.holdings.filter(h => h.category === 'defensive')
+        const defHoldings = state.holdings.filter(h => h.category === cashId)
         const cashTotal = state.cash_accounts.reduce((s, c) => s + (c.currency === 'USD' ? c.amount * fx : c.amount), 0)
         const holdingTotal = defHoldings.reduce((s, h) => s + holdingValueTwd(h.shares, h.price, h.currency, fx), 0)
         const defTargetPct =
@@ -282,6 +313,9 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
 
         const hasEtf  = defHoldings.length > 0
         const hasCash = state.cash_accounts.length > 0
+        if (!hasEtf && !hasCash) return null
+        const cashColor = cashCat?.color ?? '#6366f1'
+        const cashName  = cashCat?.name ?? '防禦資產'
         const sharesNode = hasEtf && hasCash
           ? <><span>股數</span><span className="text-emerald-600">/金額</span></>
           : hasCash
@@ -300,10 +334,10 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
           <div className="rounded-lg border overflow-hidden">
             <div
               className="flex items-center justify-between px-4 py-2.5 rounded-t-lg"
-              style={{ borderLeft: `4px solid ${CATEGORY_META.defensive.color}`, background: `${CATEGORY_META.defensive.color}12` }}
+              style={{ borderLeft: `4px solid ${cashColor}`, background: `${cashColor}12` }}
             >
               <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold" style={{ color: CATEGORY_META.defensive.color }}>防禦資產</span>
+                <span className="text-sm font-semibold" style={{ color: cashColor }}>{cashName}</span>
                 {defTargetPct > 0 && (
                   <span className="text-xs text-muted-foreground font-medium">目標 {defTargetPct}%</span>
                 )}
@@ -416,7 +450,7 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
         >
           {viewMode === 'bucket'
             ? <><Columns2 size={13} /> 帳戶視圖</>
-            : <><LayoutGrid size={13} /> 五桶視圖</>}
+            : <><LayoutGrid size={13} /> 桶視圖</>}
         </Button>
       </div>
 

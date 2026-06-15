@@ -1,6 +1,22 @@
 export type Currency = 'USD' | 'TWD'
-export type Category = 'core' | 'aggressive' | 'global' | 'alternative' | 'defensive'
+// 分類 id。為了支援使用者自訂新增/刪除分類，型別放寬為 string。
+// 預設五桶仍用 'core' | 'aggressive' | 'global' | 'alternative' | 'defensive'，
+// 舊資料的 holding.category 直接相容；現金桶 id 恆為 'defensive'（改名只動顯示名、刪除被擋）。
+export type Category = string
 export type TxType = 'buy' | 'sell' | 'cash_in' | 'cash_out' | 'new_position' | 'new_cash_account' | 'transfer'
+
+// 分類（桶）定義。Step 1 起把五桶從寫死的型別抽成可儲存的資料；
+// 之後（step 2）才開放使用者新增／刪除／改名。id 目前仍用既有的五個 union 值，
+// 確保舊資料的 holding.category 直接對得上。
+export interface CategoryDef {
+  id: Category
+  name: string
+  color: string
+  target_pct: number    // 該桶的預設目標 %（供新增持倉預填／日後用）
+  is_cash?: boolean      // 此桶收納現金帳戶（預設為 defensive）
+  palette?: string[]     // drill-down 子項配色
+  order: number          // 顯示順序
+}
 
 export interface Holding {
   symbol: string
@@ -63,6 +79,8 @@ export interface AppState {
   transactions: Transaction[]
   retirement: RetirementSettings
   snapshots: DailySnapshot[]
+  // 分類定義。可選：舊存檔／demo／測試未帶此欄時，一律 fallback 到 DEFAULT_CATEGORIES。
+  categories?: CategoryDef[]
 }
 
 export interface CategorySummary {

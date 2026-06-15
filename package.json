@@ -1,6 +1,6 @@
 {
   "name": "asset-dashboard",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "dev": "tauri dev",
@@ -10,7 +10,9 @@
     "vite:build": "tsc -b && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:update": "vitest run -u"
+    "test:update": "vitest run -u",
+    "bench": "vitest bench --run",
+    "bench:save": "vitest bench --run --outputJson=bench/baseline.json"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

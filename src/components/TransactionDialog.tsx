@@ -6,8 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import type { Holding, CashAccount, Transaction, TxType, Currency, Category } from '@/lib/types'
-import { CATEGORY_META } from '@/lib/calc'
+import type { Holding, CashAccount, Transaction, TxType, Currency, Category, CategoryDef } from '@/lib/types'
 import { getTaiwanToday } from '@/lib/dateUtils'
 
 interface Props {
@@ -16,9 +15,8 @@ interface Props {
   onSubmit: (tx: Transaction & { category?: Category; holdingName?: string; accountType?: 'bank' | 'savings_insurance' }) => void
   holdings: Holding[]
   cashAccounts: CashAccount[]
+  categories: CategoryDef[]
 }
-
-const CATEGORY_KEYS = Object.keys(CATEGORY_META) as Category[]
 
 const TYPE_LABELS: Record<TxType, string> = {
   buy: '買入', sell: '賣出', cash_in: '現金入', cash_out: '現金出',
@@ -61,7 +59,7 @@ type MainType = 'buy' | 'sell' | 'cash_in' | 'cash_out'
 const MAIN_TYPES: MainType[] = ['buy', 'sell', 'cash_in', 'cash_out']
 const MAIN_LABELS: Record<MainType, string> = { buy: '買入', sell: '賣出', cash_in: '現金入', cash_out: '現金出' }
 
-export default function TransactionDialog({ open, onClose, onSubmit, holdings, cashAccounts }: Props) {
+export default function TransactionDialog({ open, onClose, onSubmit, holdings, cashAccounts, categories }: Props) {
   const [txType, setTxType] = useState<TxType>('buy')
 
   const [date, setDate] = useState(getTaiwanToday)
@@ -84,7 +82,7 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
   // 建立股票部位
   const [newSymbol, setNewSymbol] = useState('')
   const [newName, setNewName] = useState('')
-  const [newCategory, setNewCategory] = useState<Category>('core')
+  const [newCategory, setNewCategory] = useState<Category>(categories[0]?.id ?? 'core')
   const [newCurrency, setNewCurrency] = useState<Currency>('USD')
   const [newShares, setNewShares] = useState('')
   const [newPrice, setNewPrice] = useState('')
@@ -393,11 +391,11 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
                 <Select value={newCategory} onValueChange={v => setNewCategory(v as Category)}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
-                    {CATEGORY_KEYS.map(k => (
-                      <SelectItem key={k} value={k}>
+                    {categories.map(c => (
+                      <SelectItem key={c.id} value={c.id}>
                         <span className="inline-block w-2 h-2 rounded-full mr-2 align-middle"
-                          style={{ background: CATEGORY_META[k].color }} />
-                        {CATEGORY_META[k].name}
+                          style={{ background: c.color }} />
+                        {c.name}
                       </SelectItem>
                     ))}
                   </SelectContent>

@@ -1,4 +1,4 @@
-import type { AppState, CategorySummary, RebalanceRow, DrillItem, Category, DailySnapshot, Transaction, Currency } from './types'
+import type { AppState, CategorySummary, RebalanceRow, DrillItem, Category, CategoryDef, DailySnapshot, Transaction, Currency } from './types'
 
 export interface AllocationRow {
   symbol: string
@@ -35,20 +35,37 @@ export interface TWRResult {
   series: { date: string; nav: number }[]
 }
 
-export const CATEGORY_META: Record<Category, { name: string; color: string; target_pct: number }> = {
-  core:        { name: '核心資產', color: '#3b82f6', target_pct: 35 },
-  aggressive:  { name: '攻擊資產', color: '#ef4444', target_pct: 30 },
-  global:      { name: '分散資產', color: '#10b981', target_pct: 15 },
-  alternative: { name: '另類資產', color: '#f59e0b', target_pct: 5  },
-  defensive:   { name: '防禦資產', color: '#6366f1', target_pct: 15 },
+// 五桶的唯一真相來源（single source of truth）。CATEGORY_META 與 DEFAULT_PALETTES
+// 皆由此衍生，避免重複；舊存檔沒帶 categories 時也會 fallback 到這份。
+export const DEFAULT_CATEGORIES: CategoryDef[] = [
+  { id: 'core',        name: '核心資產', color: '#3b82f6', target_pct: 35, order: 0, palette: ['#3b82f6','#60a5fa','#93c5fd','#bfdbfe'] },
+  { id: 'aggressive',  name: '攻擊資產', color: '#ef4444', target_pct: 30, order: 1, palette: ['#ef4444','#f87171','#fca5a5'] },
+  { id: 'global',      name: '分散資產', color: '#10b981', target_pct: 15, order: 2, palette: ['#10b981','#34d399','#6ee7b7'] },
+  { id: 'alternative', name: '另類資產', color: '#f59e0b', target_pct: 5,  order: 3, palette: ['#f59e0b','#fbbf24'] },
+  { id: 'defensive',   name: '防禦資產', color: '#6366f1', target_pct: 15, order: 4, is_cash: true, palette: ['#6366f1','#818cf8','#a5b4fc','#c7d2fe','#e0e7ff'] },
+]
+
+// 靜態預設五桶 meta（衍生自 DEFAULT_CATEGORIES）。尚未接 state 的元件先用這份，
+// 因為 step 1 的 state.categories 必等於預設值，所以畫面與數字完全不變。
+export const CATEGORY_META: Record<Category, { name: string; color: string; target_pct: number }> =
+  Object.fromEntries(
+    DEFAULT_CATEGORIES.map(c => [c.id, { name: c.name, color: c.color, target_pct: c.target_pct }])
+  ) as Record<Category, { name: string; color: string; target_pct: number }>
+
+const DEFAULT_PALETTES: Record<Category, string[]> =
+  Object.fromEntries(
+    DEFAULT_CATEGORIES.map(c => [c.id, c.palette ?? [c.color]])
+  ) as Record<Category, string[]>
+
+// 取得目前生效的分類清單（依 order 排序）；舊資料沒帶就用預設五桶。
+export function getCategories(state: AppState): CategoryDef[] {
+  const cats = state.categories?.length ? state.categories : DEFAULT_CATEGORIES
+  return [...cats].sort((a, b) => a.order - b.order)
 }
 
-const DRILL_PALETTES: Record<Category, string[]> = {
-  core:        ['#3b82f6','#60a5fa','#93c5fd','#bfdbfe'],
-  aggressive:  ['#ef4444','#f87171','#fca5a5'],
-  global:      ['#10b981','#34d399','#6ee7b7'],
-  alternative: ['#f59e0b','#fbbf24'],
-  defensive:   ['#6366f1','#818cf8','#a5b4fc','#c7d2fe','#e0e7ff'],
+// 收納現金帳戶的桶（預設 defensive）。
+function cashCategoryId(cats: CategoryDef[]): Category {
+  return (cats.find(c => c.is_cash)?.id ?? 'defensive') as Category
 }
 
 export function holdingValueTwd(shares: number, price: number, currency: 'USD' | 'TWD', fx: number): number {
@@ -89,48 +106,49 @@ export function totalTargetPct(state: AppState): number {
 export function categorySummaries(state: AppState): CategorySummary[] {
   const { exchange_rate: fx, holdings, cash_accounts } = state
   const total = totalAssetsTwd(state)
+  const cats = getCategories(state)
+  const cashId = cashCategoryId(cats)
 
-  const catValues: Record<Category, number> = {
-    core: 0, aggressive: 0, global: 0, alternative: 0, defensive: 0,
-  }
-  const catTargets: Record<Category, number> = {
-    core: 0, aggressive: 0, global: 0, alternative: 0, defensive: 0,
-  }
+  const catValues: Record<string, number> = {}
+  const catTargets: Record<string, number> = {}
+  for (const c of cats) { catValues[c.id] = 0; catTargets[c.id] = 0 }
 
   for (const h of holdings) {
-    catValues[h.category] += holdingValueTwd(h.shares, h.price, h.currency, fx)
-    catTargets[h.category] += h.target_pct
+    catValues[h.category] = (catValues[h.category] ?? 0) + holdingValueTwd(h.shares, h.price, h.currency, fx)
+    catTargets[h.category] = (catTargets[h.category] ?? 0) + h.target_pct
   }
   for (const c of cash_accounts) {
-    catValues.defensive += c.currency === 'USD' ? c.amount * fx : c.amount
-    catTargets.defensive += c.target_pct ?? 0
+    catValues[cashId] = (catValues[cashId] ?? 0) + (c.currency === 'USD' ? c.amount * fx : c.amount)
+    catTargets[cashId] = (catTargets[cashId] ?? 0) + (c.target_pct ?? 0)
   }
 
-  return (Object.keys(CATEGORY_META) as Category[]).map(key => ({
-    name: CATEGORY_META[key].name,
-    key,
-    value_twd: catValues[key],
-    target_pct: catTargets[key],
-    actual_pct: total > 0 ? (catValues[key] / total) * 100 : 0,
-    color: CATEGORY_META[key].color,
+  return cats.map(c => ({
+    name: c.name,
+    key: c.id,
+    value_twd: catValues[c.id] ?? 0,
+    target_pct: catTargets[c.id] ?? 0,
+    actual_pct: total > 0 ? ((catValues[c.id] ?? 0) / total) * 100 : 0,
+    color: c.color,
   }))
 }
 
 export function categoryDrillDown(state: AppState, cat: Category): DrillItem[] {
   const { exchange_rate: fx, holdings, cash_accounts } = state
-  const palette = DRILL_PALETTES[cat]
+  const def = getCategories(state).find(c => c.id === cat)
+  const palette = def?.palette ?? DEFAULT_PALETTES[cat] ?? [def?.color ?? '#6b7280']
+  const isCash = def?.is_cash ?? (cat === 'defensive')
   const items: DrillItem[] = []
 
-  if (cat === 'defensive') {
-    for (const h of holdings.filter(h => h.category === 'defensive')) {
-      items.push({
-        id: h.symbol,
-        symbol: h.symbol,
-        name: h.name,
-        value_twd: holdingValueTwd(h.shares, h.price, h.currency, fx),
-        color: '',
-      })
-    }
+  for (const h of holdings.filter(h => h.category === cat)) {
+    items.push({
+      id: h.symbol,
+      symbol: h.symbol,
+      name: h.name,
+      value_twd: holdingValueTwd(h.shares, h.price, h.currency, fx),
+      color: '',
+    })
+  }
+  if (isCash) {
     for (const c of cash_accounts) {
       const parts = c.bank.split(' ')
       items.push({
@@ -138,16 +156,6 @@ export function categoryDrillDown(state: AppState, cat: Category): DrillItem[] {
         symbol: parts[0],
         name: parts.slice(1).join(' ') || '',
         value_twd: c.currency === 'USD' ? c.amount * fx : c.amount,
-        color: '',
-      })
-    }
-  } else {
-    for (const h of holdings.filter(h => h.category === cat)) {
-      items.push({
-        id: h.symbol,
-        symbol: h.symbol,
-        name: h.name,
-        value_twd: holdingValueTwd(h.shares, h.price, h.currency, fx),
         color: '',
       })
     }
@@ -198,7 +206,7 @@ export function rebalanceRows(state: AppState): RebalanceRow[] {
       target_pct: h.target_pct,
       target_value_twd,
       delta_twd,
-      delta_usd: h.currency === 'USD' ? delta_twd / fx : undefined,
+      delta_usd: h.currency === 'USD' && fx > 0 ? delta_twd / fx : undefined,
       delta_shares: price_twd > 0 ? delta_twd / price_twd : 0,
       price: h.price,
     })
@@ -217,9 +225,10 @@ export function rebalanceRows(state: AppState): RebalanceRow[] {
     state.cash_accounts.reduce((s, c) => s + (c.target_pct ?? 0), 0)
   const defensiveTarget = (defensiveTargetPct / 100) * total
 
+  const cashName = getCategories(state).find(c => c.is_cash)?.name ?? '防禦資產'
   rows.push({
     symbol: 'DEFENSIVE',
-    name: '防禦資產 (含儲蓄險)',
+    name: `${cashName} (含儲蓄險)`,
     currency: 'TWD',
     current_value_twd: defensiveTotal,
     target_pct: defensiveTargetPct,
@@ -510,7 +519,7 @@ export function computeNewMoneyAllocation(
 
   rows.push({
     symbol: 'DEFENSIVE',
-    name: '防禦資產 (SGOV / 現金)',
+    name: `${getCategories(state).find(c => c.is_cash)?.name ?? '防禦資產'} (SGOV / 現金)`,
     currency: 'TWD',
     current_value_twd: defensiveCurrent,
     target_pct: defensiveTargetPct,

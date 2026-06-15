@@ -1,4 +1,5 @@
 import type { AppState } from './types'
+import { DEFAULT_CATEGORIES } from './calc'
 
 export const INITIAL_STATE: AppState = {
   exchange_rate: 32.0,
@@ -109,4 +110,5 @@ export const INITIAL_STATE: AppState = {
     monthly_contribution_wan: 5,
     expected_annual_return: 0.07,
   },
+  categories: DEFAULT_CATEGORIES,
 }
