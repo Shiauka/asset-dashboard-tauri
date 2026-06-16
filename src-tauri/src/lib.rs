@@ -760,19 +760,36 @@ async fn fetch_prices(holdings: Vec<HoldingInput>) -> serde_json::Value {
         let sym = h.symbol.clone();
         let cur = h.currency.clone();
         handles.push(tokio::spawn(async move {
-            let ys = if cur == "TWD" { format!("{}.TW", sym) } else { sym.clone() };
-            let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d",
-                ys
-            );
-            let price: Option<f64> = async {
-                let r = c.get(&url).send().await.ok()?;
-                if !r.status().is_success() { return None; }
-                let d: serde_json::Value = r.json().await.ok()?;
-                let p = d["chart"]["result"][0]["meta"]["regularMarketPrice"].as_f64()?;
-                if p > 0.0 { Some(p) } else { None }
+            // 決定 Yahoo 查詢符號：
+            // - 已含後綴（如 00679B.TWO）→ 直接用
+            // - 台幣標的 → 先試上市 .TW，抓不到再試上櫃 .TWO（債券 ETF 多在上櫃）
+            // - 其餘 → 原樣
+            let candidates: Vec<String> = if sym.contains('.') {
+                vec![sym.clone()]
+            } else if cur == "TWD" {
+                vec![format!("{}.TW", sym), format!("{}.TWO", sym)]
+            } else {
+                vec![sym.clone()]
+            };
+            let mut price: Option<f64> = None;
+            for ys in &candidates {
+                let url = format!(
+                    "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d",
+                    ys
+                );
+                let p: Option<f64> = async {
+                    let r = c.get(&url).send().await.ok()?;
+                    if !r.status().is_success() { return None; }
+                    let d: serde_json::Value = r.json().await.ok()?;
+                    let pp = d["chart"]["result"][0]["meta"]["regularMarketPrice"].as_f64()?;
+                    if pp > 0.0 { Some(pp) } else { None }
+                }
+                .await;
+                if p.is_some() {
+                    price = p;
+                    break;
+                }
             }
-            .await;
             (sym, price)
         }));
     }
