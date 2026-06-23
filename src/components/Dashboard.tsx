@@ -688,24 +688,16 @@ export default function Dashboard() {
             const fmtShares = (r: typeof rebalance[number]) => {
               if (r.delta_shares === undefined || r.target_pct === 0) return '—'
               const sign = r.delta_shares >= 0 ? '+' : ''
-              if (isTWD) {
-                const zhang = Math.floor(Math.abs(r.delta_shares) / 1000)
-                return zhang > 0 ? `${sign}${fmt(zhang)} 張` : `${sign}${fmt(Math.abs(r.delta_shares), 0)} 股`
-              }
-              if (isUSD) {
+              if (isTWD || isUSD || r.currency === 'TWD') {
                 const intShares = Math.floor(Math.abs(r.delta_shares))
                 return `${sign}${fmt(intShares)} 股`
-              }
-              if (r.currency === 'TWD') {
-                const zhang = Math.floor(Math.abs(r.delta_shares) / 1000)
-                return zhang > 0 ? `${sign}${fmt(zhang)} 張` : `${sign}${fmt(Math.abs(r.delta_shares), 0)} 股`
               }
               return `${sign}${fmt(r.delta_shares, 2)} 股`
             }
 
             const valueLabel = isUSD ? '現值 (USD)' : isTWD ? '現值 (TWD)' : '現值'
             const deltaLabel = isUSD ? '缺口 (USD)' : isTWD ? '缺口 (TWD)' : '缺口'
-            const sharesLabel = isTWD ? '可買/賣 (張)' : '可買/賣 (股)'
+            const sharesLabel = '可買/賣 (股)'
 
             return (
               <Card>

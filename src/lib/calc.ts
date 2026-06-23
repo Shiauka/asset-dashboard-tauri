@@ -547,17 +547,14 @@ export function computeNewMoneyAllocation(
     unallocated_twd = newMoneyTwd - sumGaps
   }
 
-  // ── Compute share counts (rounded to tradeable lots) ──
-  // TWD stocks: 1 lot = 1000 shares (台股整張)
-  // USD stocks: 1 share minimum
+  // ── Compute share counts (rounded to whole shares) ──
+  // Both TWD and USD stocks: 1 share minimum (整股交易)
   // buy_amount_twd is recalculated from rounded shares so the table is self-consistent.
   for (const r of rows) {
     if (r.is_defensive || !r.price || r.price <= 0) continue
     const price_twd  = r.currency === 'USD' ? r.price * fx : r.price
     const raw_shares = r.buy_amount_twd / price_twd
-    r.buy_shares     = r.currency === 'TWD'
-      ? Math.floor(raw_shares / 1000) * 1000
-      : Math.floor(raw_shares)
+    r.buy_shares     = Math.floor(raw_shares)
     r.buy_amount_twd = r.buy_shares * price_twd
   }
 

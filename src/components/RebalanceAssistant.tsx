@@ -223,7 +223,7 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
 
             {/* Note */}
             <div className="rounded-md bg-muted/50 px-3 py-2 text-xs text-muted-foreground space-y-1">
-              <p>· 台股以整張（1,000 股）為單位，美股以整股為單位。</p>
+              <p>· 台股與美股皆以整股為單位計算。</p>
               <p>· 防禦桶建議：優先補 SGOV（USD），再補台幣活存。</p>
               <p>· 目前持倉比例以即時報價計算，每日開盤後略有變動。</p>
               {result.unallocated_twd > 0 && (
