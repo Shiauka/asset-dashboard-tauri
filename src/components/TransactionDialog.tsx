@@ -21,6 +21,7 @@ interface Props {
 const TYPE_LABELS: Record<TxType, string> = {
   buy: '買入', sell: '賣出', cash_in: '現金入', cash_out: '現金出',
   new_position: '建立股票部位', new_cash_account: '建立現金帳戶', transfer: '帳戶轉帳',
+  dividend: '股息收入',
 }
 
 function Row({ label, sublabel, children }: { label: string; sublabel?: string; children: React.ReactNode }) {
@@ -100,11 +101,18 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
   const [transferAmount, setTransferAmount] = useState('')
   const [transferAmountTo, setTransferAmountTo] = useState('')
 
+  // 股息收入
+  const [divSymbol, setDivSymbol] = useState('')
+  const [divBank, setDivBank] = useState('')
+  const [divAmount, setDivAmount] = useState('')
+  const [divCurrency, setDivCurrency] = useState<Currency>('USD')
+
   const isStockTx = txType === 'buy' || txType === 'sell'
   const isCashTx = txType === 'cash_in' || txType === 'cash_out'
   const isNewPos = txType === 'new_position'
   const isNewCash = txType === 'new_cash_account'
   const isTransfer = txType === 'transfer'
+  const isDividend = txType === 'dividend'
   const isCreate = isNewPos || isNewCash
 
   const fromAccount = cashAccounts.find(c => c.bank === transferFrom)
@@ -132,6 +140,7 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
     setNewSymbol(''); setNewName(''); setNewShares(''); setNewPrice(''); setNewTargetPct('')
     setNewBankName(''); setNewBankAmount('')
     setTransferFrom(''); setTransferTo(''); setTransferAmount(''); setTransferAmountTo('')
+    setDivSymbol(''); setDivBank(''); setDivAmount('')
     setNote('')
   }
 
@@ -205,6 +214,18 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
       onSubmit(tx)
     }
 
+    if (isDividend) {
+      const tx: Transaction = {
+        id: `${Date.now()}`,
+        date, type: 'dividend', currency: divCurrency,
+        symbol: divSymbol || undefined,
+        bank: divBank && divBank !== '__none' ? divBank : undefined,
+        amount: parseFloat(divAmount) || 0,
+        note: note || undefined,
+      }
+      onSubmit(tx)
+    }
+
     reset()
     onClose()
   }
@@ -214,7 +235,8 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
     (isCashTx && !!bank && !!cashAmount) ||
     (isNewPos && !!newSymbol) ||
     (isNewCash && !!newBankName) ||
-    (isTransfer && !!transferFrom && !!transferTo && transferFrom !== transferTo && !!transferAmount && (!isCrossCurrency || !!transferAmountTo))
+    (isTransfer && !!transferFrom && !!transferTo && transferFrom !== transferTo && !!transferAmount && (!isCrossCurrency || !!transferAmountTo)) ||
+    (isDividend && !!divAmount)
 
   // Active button uses explicit brand orange (#E87930) to avoid CSS-var resolution issues in Tailwind v4
   // 選取態用品牌橘，與深色 modal 底（#1a1a2e）拉開對比，避免選取/未選取難分辨
@@ -245,11 +267,11 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
             ))}
           </div>
 
-          {/* 建立部位 / 轉帳 */}
-          <div className="grid grid-cols-3 gap-1.5">
+          {/* 建立部位 / 股息 / 轉帳 */}
+          <div className="grid grid-cols-4 gap-1.5">
             <button
               onClick={() => { setTxType('new_position'); reset() }}
-              className={`rounded-md py-2 text-sm font-medium border transition-colors ${
+              className={`rounded-md py-1.5 text-xs font-medium border transition-colors ${
                 isNewPos
                   ? 'bg-emerald-600 text-white border-emerald-600'
                   : 'border-dashed border-emerald-500 text-emerald-400 hover:bg-emerald-500/10'
@@ -258,8 +280,18 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
               + 建立股票
             </button>
             <button
+              onClick={() => { setTxType('dividend'); reset() }}
+              className={`rounded-md py-1.5 text-xs font-medium border transition-colors ${
+                isDividend
+                  ? 'bg-teal-600 text-white border-teal-600'
+                  : 'border-dashed border-teal-500 text-teal-400 hover:bg-teal-500/10'
+              }`}
+            >
+              股息收入
+            </button>
+            <button
               onClick={() => { setTxType('transfer'); reset() }}
-              className={`rounded-md py-2 text-sm font-medium border transition-colors ${
+              className={`rounded-md py-1.5 text-xs font-medium border transition-colors ${
                 isTransfer
                   ? 'bg-amber-500 text-white border-amber-500'
                   : 'border-dashed border-amber-400 text-amber-400 hover:bg-amber-500/10'
@@ -269,7 +301,7 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
             </button>
             <button
               onClick={() => { setTxType('new_cash_account'); reset() }}
-              className={`rounded-md py-2 text-sm font-medium border transition-colors ${
+              className={`rounded-md py-1.5 text-xs font-medium border transition-colors ${
                 isNewCash
                   ? 'bg-indigo-600 text-white border-indigo-600'
                   : 'border-dashed border-indigo-400 text-indigo-400 hover:bg-indigo-500/10'
@@ -505,6 +537,55 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
               <Row label="手續費" sublabel="選填">
                 <Input type="number" step="0.01" placeholder="0" value={commission}
                   onChange={e => setCommission(e.target.value)} />
+              </Row>
+            </>
+          )}
+
+          {/* ── 股息收入 ── */}
+          {isDividend && (
+            <>
+              <Row label="來源標的" sublabel="選填">
+                <Select value={divSymbol} onValueChange={v => { setDivSymbol(v); const h = holdings.find(h => h.symbol === v); if (h) setDivCurrency(h.currency) }}>
+                  <SelectTrigger><SelectValue placeholder="選擇持倉（可略）" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none">不指定</SelectItem>
+                    {holdings.map(h => (
+                      <SelectItem key={h.symbol} value={h.symbol}>
+                        <span className="font-mono font-medium">{h.symbol}</span>
+                        <span className="text-muted-foreground text-xs ml-2">{h.name}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Row>
+              <Row label="股息金額">
+                <div className="flex gap-2">
+                  <Input type="number" step="0.01" placeholder="0" value={divAmount}
+                    onChange={e => setDivAmount(e.target.value)} />
+                  <Select value={divCurrency} onValueChange={v => setDivCurrency(v as Currency)}>
+                    <SelectTrigger className="w-24"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="USD">USD</SelectItem>
+                      <SelectItem value="TWD">TWD</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </Row>
+              <Row label="入帳帳戶" sublabel="選填">
+                <Select value={divBank} onValueChange={setDivBank}>
+                  <SelectTrigger><SelectValue placeholder="不連動帳戶" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none">不連動</SelectItem>
+                    {cashAccounts.filter(c => c.currency === divCurrency).map(c => (
+                      <SelectItem key={c.id} value={c.bank}>
+                        <span className="font-medium">{c.bank.split(' ')[0]}</span>
+                        {c.bank.includes(' ') && (
+                          <span className="text-xs ml-1 text-muted-foreground">{c.bank.split(' ').slice(1).join(' ')}</span>
+                        )}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </Row>
             </>
           )}

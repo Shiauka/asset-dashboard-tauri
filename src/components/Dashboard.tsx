@@ -860,12 +860,13 @@ export default function Dashboard() {
                         const typeLabel: Record<TxType, string> = {
                           buy: '買入', sell: '賣出', cash_in: '現金入', cash_out: '現金出',
                           new_position: '建立股票', new_cash_account: '建立現金', transfer: '帳戶轉帳',
+                          dividend: '股息收入',
                         }
                         const typeColor: Record<TxType, string> = {
                           buy: 'text-emerald-600', sell: 'text-red-500',
                           cash_in: 'text-blue-500', cash_out: 'text-orange-500',
                           new_position: 'text-purple-600', new_cash_account: 'text-indigo-600',
-                          transfer: 'text-amber-600',
+                          transfer: 'text-amber-600', dividend: 'text-teal-600',
                         }
                         return (
                           <tr key={tx.id} className="border-b hover:bg-muted/30">

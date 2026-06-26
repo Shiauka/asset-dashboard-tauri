@@ -155,6 +155,7 @@ export function applyTransaction(
       else if (tx.type === 'cash_out') c.amount -= tx.amount
       else if (tx.type === 'buy') c.amount -= tx.amount + fee
       else if (tx.type === 'sell') c.amount += tx.amount - fee
+      else if (tx.type === 'dividend') c.amount += tx.amount
       next.cash_accounts = [...next.cash_accounts]
       next.cash_accounts[idx] = c
     }
@@ -346,6 +347,17 @@ export function reverseTransaction(state: AppState, id: string): AppState {
       next = { ...next, cash_accounts: accounts }
       break
     }
+    case 'dividend': {
+      if (tx.bank) {
+        const idx = next.cash_accounts.findIndex(c => c.bank === tx.bank)
+        if (idx >= 0) {
+          const cash_accounts = [...next.cash_accounts]
+          cash_accounts[idx] = { ...cash_accounts[idx], amount: cash_accounts[idx].amount - tx.amount }
+          next = { ...next, cash_accounts }
+        }
+      }
+      break
+    }
   }
 
   return next
@@ -411,6 +423,10 @@ export function retroactivelyAdjustSnapshots(
           h[tx.bank_to] += direction * toTwd(amtTo, curTo)
         }
         break
+      case 'dividend':
+        if (tx.bank && h[tx.bank] !== undefined)
+          h[tx.bank] += direction * toTwd(tx.amount, tx.currency)
+        break
     }
 
     const newTotal = Object.values(h).reduce((s, v) => s + Math.max(0, v), 0)
@@ -451,7 +467,7 @@ export function addSnapshot(state: AppState, total_twd: number): AppState {
     holdings_twd[c.bank] = c.currency === 'USD' ? c.amount * fx : c.amount
   }
 
-  const snapshot = { date, total_twd, bucket_pct, holdings_twd, holdings_shares }
+  const snapshot = { date, total_twd, bucket_pct, holdings_twd, holdings_shares, exchange_rate: state.exchange_rate }
   const existing = state.snapshots ?? []
   const filtered = existing.filter(s => s.date !== date)
   const sorted = [...filtered, snapshot].sort((a, b) => a.date.localeCompare(b.date))

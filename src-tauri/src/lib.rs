@@ -157,7 +157,7 @@ fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64)
                 }
             }
         }
-        "cash_in" => {
+        "cash_in" | "dividend" => {
             if let Some(bk) = bank {
                 if let Some(arr) = state["cash_accounts"].as_array_mut() {
                     if let Some(c) = arr.iter_mut().find(|c| c["bank"].as_str() == Some(bk)) {

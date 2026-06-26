@@ -1,12 +1,12 @@
 'use client'
 
-import React, { useState } from 'react'
-import { Trash2, LayoutGrid, Columns2 } from 'lucide-react'
+import React, { useMemo, useState } from 'react'
+import { Trash2, LayoutGrid, Columns2, TrendingUp } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { AppState, Category, Currency } from '@/lib/types'
-import { holdingValueTwd, getCategories } from '@/lib/calc'
+import { holdingValueTwd, getCategories, computeCostBases } from '@/lib/calc'
 import {
   updateHoldingPrice, updateHoldingTargetPct, updateCashAccountTargetPct,
   deleteHolding, deleteCashAccount, setHoldingCategory,
@@ -38,7 +38,7 @@ type EditingState =
   | { kind: 'holding'; symbol: string; field: HoldingField }
   | { kind: 'holding-cat'; symbol: string }
   | { kind: 'cash'; id: string }
-type ViewMode = 'bucket' | 'account'
+type ViewMode = 'bucket' | 'account' | 'pnl'
 
 const CCY_META: Record<Currency, { label: string; color: string }> = {
   TWD: { label: '台幣帳戶', color: '#2563EB' },
@@ -83,6 +83,15 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
   const [editVal, setEditVal] = useState('')
   const [viewMode, setViewMode] = useState<ViewMode>('bucket')
   const fx = state.exchange_rate
+
+  const costBases = useMemo(
+    () => computeCostBases(state.transactions, state.holdings, fx),
+    [state.transactions, state.holdings, fx],
+  )
+  const totalUnrealizedGain = useMemo(
+    () => Object.values(costBases).reduce((s, cb) => s + cb.unrealizedGain, 0),
+    [costBases],
+  )
 
   const cats = getCategories(state)
   const catMap = new Map(cats.map(c => [c.id, c]))
@@ -437,6 +446,92 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
       )
     })
 
+  // ── P&L view ─────────────────────────────────────────────────────────────
+
+  const renderPnlView = () => {
+    const items = [...state.holdings].sort(
+      (a, b) => holdingValueTwd(b.shares, b.price, b.currency, fx) - holdingValueTwd(a.shares, a.price, a.currency, fx)
+    )
+    const gainColor = totalUnrealizedGain >= 0 ? 'text-emerald-600' : 'text-red-500'
+    return (
+      <div className="rounded-lg border overflow-hidden">
+        <div className="flex items-center justify-between px-4 py-2.5 bg-muted/20 rounded-t-lg">
+          <span className="text-sm font-semibold">未實現損益（加權均攤成本法）</span>
+          <span className={`text-sm font-bold ${gainColor} ${amtClass}`}>
+            {totalUnrealizedGain >= 0 ? '+' : ''}{fmt(totalUnrealizedGain / 10000, 1)} 萬
+          </span>
+        </div>
+        <div className="flex items-center px-4 py-1.5 text-xs text-muted-foreground border-b">
+          <span className={COL.symbol}>代號</span>
+          <span className={COL.name}>名稱</span>
+          <span className={COL.shares}>股數</span>
+          <span className={COL.price}>均攤成本</span>
+          <span className={COL.ccy}>幣</span>
+          <span className={COL.target}>損益%</span>
+          <span className={COL.value}>未實現損益</span>
+          <span className={`${COL.cat} block text-center`}>桶</span>
+          <span className={COL.del} />
+        </div>
+        {items.map((h, idx) => {
+          const cb = costBases[h.symbol]
+          const hasData = cb && cb.totalCostTwd > 0
+          const gainPct = hasData ? cb.unrealizedPct : null
+          const gainTwd = hasData ? cb.unrealizedGain : null
+          const pctColor = gainPct == null ? '' : gainPct >= 0 ? 'text-emerald-600' : 'text-red-500'
+          const ttwdColor = gainTwd == null ? '' : gainTwd >= 0 ? 'text-emerald-600' : 'text-red-500'
+          return (
+            <div key={h.symbol}
+              className={`flex items-center px-4 py-2 text-sm hover:bg-muted/40 transition-colors ${idx < items.length - 1 ? 'border-b' : ''}`}
+            >
+              <span className={`${COL.symbol} font-mono font-semibold text-xs tracking-wider`}>{h.symbol}</span>
+              <span className={`${COL.name} text-xs text-muted-foreground truncate`}>{h.name}</span>
+              <span className={`${COL.shares} tabular-nums text-xs ${amtClass}`}>{fmt(h.shares, 4)}</span>
+              <span className={`${COL.price} tabular-nums text-xs ${amtClass}`}>
+                {hasData
+                  ? (h.currency === 'USD' ? `$${fmt(cb.avgCost, 2)}` : fmt(cb.avgCost, 2))
+                  : <span className="text-muted-foreground/40">—</span>}
+              </span>
+              <span className={COL.ccy}>
+                <Badge variant="secondary" className="text-[10px] px-1 py-0">{h.currency}</Badge>
+              </span>
+              <span className={`${COL.target} tabular-nums text-xs font-medium ${pctColor}`}>
+                {gainPct == null
+                  ? <span className="text-muted-foreground/40">—</span>
+                  : `${gainPct >= 0 ? '+' : ''}${(gainPct * 100).toFixed(1)}%`}
+              </span>
+              <span className={`${COL.value} tabular-nums text-xs font-semibold ${ttwdColor} ${amtClass}`}>
+                {gainTwd == null
+                  ? <span className="text-muted-foreground/40">—</span>
+                  : `${gainTwd >= 0 ? '+' : ''}${fmt(gainTwd / 10000, 1)} 萬`}
+              </span>
+              <span className={`${COL.cat} relative`}>
+                {isCatEditing(h.symbol) ? (
+                  <select autoFocus value={h.category}
+                    onChange={e => { onUpdate(setHoldingCategory(state, h.symbol, e.target.value)); setEditing(null) }}
+                    onBlur={() => setEditing(null)}
+                    className="absolute right-0 top-1/2 -translate-y-1/2 z-20 h-6 w-[120px] text-xs border rounded bg-background">
+                    {cats.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                ) : (
+                  <button onClick={() => setEditing({ kind: 'holding-cat', symbol: h.symbol })}
+                    title={`桶：${catMap.get(h.category)?.name ?? h.category}`}
+                    className="w-3.5 h-3.5 rounded-full border border-black/10 hover:ring-2 hover:ring-offset-1 hover:ring-muted-foreground/30"
+                    style={{ background: catMap.get(h.category)?.color ?? '#9ca3af' }} />
+                )}
+              </span>
+              <span className={COL.del}>
+                <button onClick={() => handleDeleteHolding(h.symbol, h.name)}
+                  className="text-muted-foreground/40 hover:text-red-500 transition-colors" title="刪除">
+                  <Trash2 size={13} />
+                </button>
+              </span>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
   // ── Render ───────────────────────────────────────────────────────────────
 
   return (
@@ -445,16 +540,18 @@ export default function HoldingsTable({ state, onUpdate, blurred = false }: Prop
         <Button
           variant="outline"
           size="sm"
-          onClick={() => setViewMode(v => v === 'bucket' ? 'account' : 'bucket')}
+          onClick={() => setViewMode(v => v === 'bucket' ? 'account' : v === 'account' ? 'pnl' : 'bucket')}
           className="text-xs gap-1.5 h-7"
         >
           {viewMode === 'bucket'
             ? <><Columns2 size={13} /> 帳戶視圖</>
-            : <><LayoutGrid size={13} /> 桶視圖</>}
+            : viewMode === 'account'
+              ? <><TrendingUp size={13} /> 損益視圖</>
+              : <><LayoutGrid size={13} /> 桶視圖</>}
         </Button>
       </div>
 
-      {viewMode === 'bucket' ? renderBucketView() : renderAccountView()}
+      {viewMode === 'bucket' ? renderBucketView() : viewMode === 'account' ? renderAccountView() : renderPnlView()}
     </div>
   )
 }

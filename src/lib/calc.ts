@@ -1,4 +1,4 @@
-import type { AppState, CategorySummary, RebalanceRow, DrillItem, Category, CategoryDef, DailySnapshot, Transaction, Currency } from './types'
+import type { AppState, CategorySummary, RebalanceRow, DrillItem, Category, CategoryDef, DailySnapshot, Transaction, Currency, Holding } from './types'
 
 export interface AllocationRow {
   symbol: string
@@ -274,18 +274,28 @@ function computeTWRImpl(
   if (sorted.length < 2) return null
 
   // Net external cash flows (TWD). Only cash_in / cash_out are external.
+  // dividend is portfolio income (not external) and must NOT appear here.
   // Attach each flow to the first snapshot ON OR AFTER its date, so a flow on a
   // day without a snapshot (app not opened that day) is still stripped from the
   // return instead of being miscounted as investment P/L.
   const snapDates = sorted.map(s => s.date)
+
+  // Feature 7: use snapshot-time FX when available; fall back to current rate.
+  // Snapshots taken after this fix will carry exchange_rate; older ones won't.
+  const fxBySnapDate: Record<string, number> = {}
+  for (const s of sorted) {
+    if (s.exchange_rate && s.exchange_rate > 0) fxBySnapDate[s.date] = s.exchange_rate
+  }
+
   const cfMap: Record<string, number> = {}
   for (const tx of transactions) {
     if (tx.type !== 'cash_in' && tx.type !== 'cash_out') continue
-    // budget-synced transactions may lack currency; default to TWD
-    const twd = (tx.currency ?? 'TWD') === 'TWD' ? tx.amount : tx.amount * exchangeRate
-    const sign = tx.type === 'cash_in' ? 1 : -1
     const target = snapDates.find(d => d >= tx.date)
     if (target == null) continue // flow after the last snapshot — applied once a later snapshot exists
+    const txFx = fxBySnapDate[target] ?? exchangeRate
+    // budget-synced transactions may lack currency; default to TWD
+    const twd = (tx.currency ?? 'TWD') === 'TWD' ? tx.amount : tx.amount * txFx
+    const sign = tx.type === 'cash_in' ? 1 : -1
     cfMap[target] = (cfMap[target] ?? 0) + sign * twd
   }
 
@@ -421,6 +431,111 @@ function computeTWRImpl(
   const oneYearGain = oneYearReturn != null ? gainBetween(oneYearAgoDate, endDate) : null
 
   return { twr, annualized, days, startDate, endDate, ytdReturn, oneYearReturn, totalGain, ytdGain, oneYearGain, yearlyReturns, monthlyReturns, series }
+}
+
+// ── Feature 1: Cost basis + unrealized P/L ─────────────────────────────────
+// Weighted-average cost (WAC) per holding, derived from buy / new_position / sell history.
+// dividend does not affect cost basis; sell reduces the WAC pool proportionally.
+export interface CostBasis {
+  avgCost: number        // per share in original currency
+  totalCostTwd: number   // total cost in TWD (USD shares × current fx)
+  unrealizedGain: number // current value − totalCostTwd in TWD
+  unrealizedPct: number  // unrealizedGain / totalCostTwd
+}
+
+export function computeCostBases(
+  transactions: Transaction[],
+  holdings: Holding[],
+  fx: number,
+): Record<string, CostBasis> {
+  const wac: Record<string, { shares: number; costOrig: number; currency: Currency }> = {}
+  const sorted = [...transactions].sort((a, b) => a.date.localeCompare(b.date))
+
+  for (const tx of sorted) {
+    if ((tx.type === 'buy' || tx.type === 'new_position') && tx.symbol && tx.shares != null && tx.price != null) {
+      const sym = tx.symbol
+      if (!wac[sym]) wac[sym] = { shares: 0, costOrig: 0, currency: tx.currency }
+      wac[sym].shares += tx.shares
+      wac[sym].costOrig += tx.shares * tx.price + (tx.commission ?? 0)
+    }
+    if (tx.type === 'sell' && tx.symbol && tx.shares != null) {
+      const entry = wac[tx.symbol]
+      if (entry && entry.shares > 0) {
+        const avg = entry.costOrig / entry.shares
+        entry.shares = Math.max(0, entry.shares - tx.shares)
+        entry.costOrig = avg * entry.shares
+      }
+    }
+  }
+
+  const result: Record<string, CostBasis> = {}
+  for (const h of holdings) {
+    const entry = wac[h.symbol]
+    const currentValue = holdingValueTwd(h.shares, h.price, h.currency, fx)
+    if (!entry || entry.shares <= 0 || entry.costOrig <= 0) {
+      result[h.symbol] = { avgCost: 0, totalCostTwd: 0, unrealizedGain: 0, unrealizedPct: 0 }
+      continue
+    }
+    const avgCost = entry.costOrig / entry.shares
+    const totalCostTwd = entry.currency === 'USD' ? entry.costOrig * fx : entry.costOrig
+    const unrealizedGain = currentValue - totalCostTwd
+    const unrealizedPct = totalCostTwd > 0 ? unrealizedGain / totalCostTwd : 0
+    result[h.symbol] = { avgCost, totalCostTwd, unrealizedGain, unrealizedPct }
+  }
+  return result
+}
+
+// ── Feature 3: Realized gains + dividend income for tax summary ─────────────
+// WAC method: same pool as computeCostBases, updated on every sell.
+// USD amounts converted to TWD using current fx (historical rate not stored before Feature 7).
+export interface TaxSummary {
+  byYear: Record<string, { realizedGain: number; dividendIncome: number }>
+  entries: Array<{
+    date: string; symbol: string; shares: number
+    avgCost: number; salePrice: number; currency: Currency; realizedGain: number
+  }>
+  totalRealizedGain: number
+  totalDividendIncome: number
+}
+
+export function computeTaxSummary(transactions: Transaction[], fx: number): TaxSummary {
+  const sorted = [...transactions].sort((a, b) => a.date.localeCompare(b.date))
+  const wac: Record<string, { shares: number; costOrig: number; currency: Currency }> = {}
+  const byYear: Record<string, { realizedGain: number; dividendIncome: number }> = {}
+  const entries: TaxSummary['entries'] = []
+
+  const ensureYear = (y: string) => { if (!byYear[y]) byYear[y] = { realizedGain: 0, dividendIncome: 0 } }
+
+  for (const tx of sorted) {
+    const year = tx.date.slice(0, 4)
+    if ((tx.type === 'buy' || tx.type === 'new_position') && tx.symbol && tx.shares != null && tx.price != null) {
+      const sym = tx.symbol
+      if (!wac[sym]) wac[sym] = { shares: 0, costOrig: 0, currency: tx.currency }
+      wac[sym].shares += tx.shares
+      wac[sym].costOrig += tx.shares * tx.price + (tx.commission ?? 0)
+    }
+    if (tx.type === 'sell' && tx.symbol && tx.shares != null && tx.price != null) {
+      ensureYear(year)
+      const entry = wac[tx.symbol]
+      const avgCost = entry && entry.shares > 0 ? entry.costOrig / entry.shares : tx.price
+      const gainOrig = (tx.price - avgCost) * tx.shares - (tx.commission ?? 0)
+      const realizedGain = tx.currency === 'USD' ? gainOrig * fx : gainOrig
+      entries.push({ date: tx.date, symbol: tx.symbol, shares: tx.shares, avgCost, salePrice: tx.price, currency: tx.currency, realizedGain })
+      byYear[year].realizedGain += realizedGain
+      if (entry && entry.shares > 0) {
+        entry.shares = Math.max(0, entry.shares - tx.shares)
+        entry.costOrig = avgCost * entry.shares
+      }
+    }
+    if (tx.type === 'dividend') {
+      ensureYear(year)
+      byYear[year].dividendIncome += tx.currency === 'USD' ? tx.amount * fx : tx.amount
+    }
+  }
+
+  const totalRealizedGain = Object.values(byYear).reduce((s, v) => s + v.realizedGain, 0)
+  const totalDividendIncome = Object.values(byYear).reduce((s, v) => s + v.dividendIncome, 0)
+  return { byYear, entries, totalRealizedGain, totalDividendIncome }
 }
 
 // Rebalance assistant: given new money (in TWD), compute how to allocate across holdings.

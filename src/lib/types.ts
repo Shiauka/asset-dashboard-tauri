@@ -3,7 +3,7 @@ export type Currency = 'USD' | 'TWD'
 // 預設五桶仍用 'core' | 'aggressive' | 'global' | 'alternative' | 'defensive'，
 // 舊資料的 holding.category 直接相容；現金桶 id 恆為 'defensive'（改名只動顯示名、刪除被擋）。
 export type Category = string
-export type TxType = 'buy' | 'sell' | 'cash_in' | 'cash_out' | 'new_position' | 'new_cash_account' | 'transfer'
+export type TxType = 'buy' | 'sell' | 'cash_in' | 'cash_out' | 'new_position' | 'new_cash_account' | 'transfer' | 'dividend'
 
 // 分類（桶）定義。Step 1 起把五桶從寫死的型別抽成可儲存的資料；
 // 之後（step 2）才開放使用者新增／刪除／改名。id 目前仍用既有的五個 union 值，
@@ -70,6 +70,7 @@ export interface DailySnapshot {
   bucket_pct?: Partial<Record<Category, number>>  // % of total per bucket
   holdings_twd?: Record<string, number>           // symbol/bank → TWD value
   holdings_shares?: Record<string, number>        // symbol → share count
+  exchange_rate?: number                          // USD/TWD rate recorded at snapshot time (Feature 7)
 }
 
 export interface AppState {
