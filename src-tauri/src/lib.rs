@@ -203,12 +203,13 @@ fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64)
             }
         }
         "new_position" => {
-            // apply (sign>0): set the holding's shares to the position size;
-            // reverse (sign<0): clear it back to 0. Matches the TS path's set-not-add.
+            // Treated as buy/sell for retroactive snapshot patching (add, not set).
             if let Some(sym) = symbol {
                 if let Some(arr) = state["holdings"].as_array_mut() {
                     if let Some(h) = arr.iter_mut().find(|h| h["symbol"].as_str() == Some(sym)) {
-                        h["shares"] = serde_json::json!(if sign > 0.0 { shares } else { 0.0 });
+                        if let Some(sh) = h["shares"].as_f64() {
+                            h["shares"] = serde_json::json!(sh + sign * shares);
+                        }
                     }
                 }
             }

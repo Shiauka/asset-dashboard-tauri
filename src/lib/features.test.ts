@@ -133,6 +133,118 @@ describe('computeCostBases — 個股成本基礎', () => {
   })
 })
 
+// ── Bug fix: new_position 重複建立同一標的應累積股數（v0.5.1 修正）──────────────
+
+describe('new_position — 重複建立同一台股標的（v0.5.0 回報 bug）', () => {
+  function freshState(): AppState {
+    const s = baseState()
+    return { ...s, holdings: s.holdings.filter(h => h.symbol !== '0050'), transactions: [] as Transaction[] }
+  }
+  const np = (id: string, date: string, shares: number, price = 180): Transaction =>
+    ({ id, date, type: 'new_position', symbol: '0050', shares, price, currency: 'TWD', amount: shares * price })
+
+  // ── Case 1: 核心 bug 重現 ──────────────────────────────────────────────────
+  it('10 筆 new_position 同標的：持倉股數應累計為 10000 而非停在 1000', () => {
+    let s = freshState()
+    for (let i = 0; i < 10; i++) {
+      s = applyTransaction(s as AppState, np(`np${i}`, `2026-06-${18 + Math.floor(i / 2)}`, 1000) as Parameters<typeof applyTransaction>[1])
+    }
+    const h = s.holdings.find(h => h.symbol === '0050')
+    expect(h).toBeDefined()
+    expect(h!.shares).toBe(10000)
+    expect(s.transactions).toHaveLength(10)  // 全部記錄在歷史
+  })
+
+  // ── Case 2: 第一筆建立持倉，後續 new_position 照樣累積 ──────────────────────
+  it('第 1 筆建立持倉，第 2–3 筆仍正確累積', () => {
+    let s = freshState()
+    s = applyTransaction(s as AppState, np('a', '2026-06-18', 1000) as Parameters<typeof applyTransaction>[1])
+    s = applyTransaction(s as AppState, np('b', '2026-06-19', 2000) as Parameters<typeof applyTransaction>[1])
+    s = applyTransaction(s as AppState, np('c', '2026-06-20', 500)  as Parameters<typeof applyTransaction>[1])
+    expect(s.holdings.find(h => h.symbol === '0050')!.shares).toBe(3500)
+  })
+
+  // ── Case 3: new_position 之後加 buy，兩者都正確累積 ────────────────────────
+  it('new_position(1000) 後接 buy(500)：持倉 = 1500', () => {
+    let s = freshState()
+    s = applyTransaction(s as AppState, np('np1', '2026-06-18', 1000) as Parameters<typeof applyTransaction>[1])
+    const buyTx: Transaction = { id: 'b1', date: '2026-06-20', type: 'buy', symbol: '0050', shares: 500, price: 185, currency: 'TWD', amount: 92500 }
+    s = applyTransaction(s as AppState, buyTx)
+    expect(s.holdings.find(h => h.symbol === '0050')!.shares).toBe(1500)
+  })
+
+  // ── Case 4: 全部撤銷 — reverse 順序正確，最後移除持倉 ──────────────────────
+  it('new_position 建立後 reverseTransaction 應正確扣還股數，撤完才刪持倉', () => {
+    let s = freshState()
+    s = applyTransaction(s as AppState, np('np1', '2026-06-18', 1000) as Parameters<typeof applyTransaction>[1])
+    s = applyTransaction(s as AppState, np('np2', '2026-06-19', 2000, 182) as Parameters<typeof applyTransaction>[1])
+    expect(s.holdings.find(h => h.symbol === '0050')!.shares).toBe(3000)
+    // 撤 np2 → 剩 1000，持倉仍在
+    s = reverseTransaction(s as AppState, 'np2')
+    const after2 = s.holdings.find(h => h.symbol === '0050')
+    expect(after2).toBeDefined()
+    expect(after2!.shares).toBe(1000)
+    // 撤 np1 → 降到 0，持倉應被移除
+    s = reverseTransaction(s as AppState, 'np1')
+    expect(s.holdings.find(h => h.symbol === '0050')).toBeUndefined()
+    expect(s.transactions).toHaveLength(0)
+  })
+
+  // ── Case 5: 全新標的（第一次建立）行為不變 ────────────────────────────────
+  it('全新標的第一次 new_position 仍正常建立持倉', () => {
+    let s = freshState()
+    s = applyTransaction(s as AppState, { id: 'x1', date: '2026-06-18', type: 'new_position', symbol: 'NEWETF', shares: 500, price: 50, currency: 'TWD', amount: 25000, holdingName: '新 ETF', category: 'core', target_pct: 5 } as Parameters<typeof applyTransaction>[1])
+    const h = s.holdings.find(h => h.symbol === 'NEWETF')
+    expect(h).toBeDefined()
+    expect(h!.shares).toBe(500)
+    expect(h!.name).toBe('新 ETF')
+    expect(h!.target_pct).toBe(5)
+  })
+
+  // ── Case 6: 重複 new_position 後 price 更新為最後一筆 ─────────────────────
+  it('重複 new_position：price 更新為最後一筆的成交價', () => {
+    let s = freshState()
+    s = applyTransaction(s as AppState, np('a', '2026-06-18', 1000, 170) as Parameters<typeof applyTransaction>[1])
+    s = applyTransaction(s as AppState, np('b', '2026-06-22', 1000, 185) as Parameters<typeof applyTransaction>[1])
+    expect(s.holdings.find(h => h.symbol === '0050')!.price).toBe(185)
+  })
+
+  // ── Case 7: computeCostBases 與 h.shares 一致 ─────────────────────────────
+  it('重複 new_position 後 computeCostBases avgCost 正確，h.shares = 3000', () => {
+    let s = freshState()
+    s = applyTransaction(s as AppState, np('a', '2026-06-18', 1000, 170) as Parameters<typeof applyTransaction>[1])
+    s = applyTransaction(s as AppState, np('b', '2026-06-19', 2000, 180) as Parameters<typeof applyTransaction>[1])
+    expect(s.holdings.find(h => h.symbol === '0050')!.shares).toBe(3000)
+    // computeCostBases（靜態 import 在檔案頂部）用 transactions 算 WAC
+    const cb = computeCostBases(s.transactions, s.holdings, FX)
+    // avgCost = (1000×170 + 2000×180) / 3000 ≈ 176.67
+    expect(cb['0050'].avgCost).toBeCloseTo((1000 * 170 + 2000 * 180) / 3000, 2)
+    // totalCostTwd = 3000 × avgCost（TWD 不乘 fx）
+    expect(cb['0050'].totalCostTwd).toBeCloseTo(1000 * 170 + 2000 * 180, 0)
+  })
+
+  // ── Case 8: retroactivelyAdjustSnapshots — new_position 使用 ADD 語義 ──────
+  it('retroactivelyAdjustSnapshots: new_position 對快照用 ADD，不覆蓋既有值', () => {
+    let s = freshState()
+    // 先建一個快照，代表此標的已有部位 (1000 股 × 170 = 170000 TWD)
+    s = {
+      ...s,
+      holdings: [{ symbol: '0050', name: 'ETF', currency: 'TWD', category: 'core', shares: 1000, price: 170, target_pct: 5 }],
+      snapshots: [{
+        date: '2026-06-17',
+        total_twd: 170000,
+        bucket_pct: {},
+        holdings_twd: { '0050': 170000 },
+      }],
+    }
+    // 新增一筆 new_position（past-dated 6/16）：1000 股 × 160
+    const tx: Transaction = { id: 'np_retro', date: '2026-06-16', type: 'new_position', symbol: '0050', shares: 1000, price: 160, currency: 'TWD', amount: 160000 }
+    const adjusted = retroactivelyAdjustSnapshots(s as AppState, tx, 1)
+    // 快照的 0050 holdings_twd 應是 170000 + 160000 = 330000（ADD，非 SET 到 160000）
+    expect(adjusted.snapshots[0].holdings_twd!['0050']).toBeCloseTo(170000 + 160000, 0)
+  })
+})
+
 // ── Feature 2: dividend 交易類型 ──────────────────────────────────────────────
 
 describe('dividend — applyTransaction', () => {

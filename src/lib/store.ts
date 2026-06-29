@@ -121,6 +121,13 @@ export function applyTransaction(
         target_pct: tx.target_pct ?? 0,
       }
       next.holdings = [...next.holdings, newHolding]
+    } else {
+      // Holding already exists — accumulate shares (same semantics as buy)
+      const h = { ...next.holdings[exists] }
+      h.shares = (h.shares ?? 0) + (tx.shares ?? 0)
+      if (tx.price) h.price = tx.price
+      next.holdings = [...next.holdings]
+      next.holdings[exists] = h
     }
     return next
   }
@@ -324,7 +331,17 @@ export function reverseTransaction(state: AppState, id: string): AppState {
     }
     case 'new_position': {
       if (tx.symbol) {
-        next = { ...next, holdings: next.holdings.filter(h => h.symbol !== tx.symbol) }
+        const idx = next.holdings.findIndex(h => h.symbol === tx.symbol)
+        if (idx >= 0) {
+          const newShares = (next.holdings[idx].shares ?? 0) - (tx.shares ?? 0)
+          if (newShares <= 0) {
+            next = { ...next, holdings: next.holdings.filter(h => h.symbol !== tx.symbol) }
+          } else {
+            const holdings = [...next.holdings]
+            holdings[idx] = { ...holdings[idx], shares: newShares }
+            next = { ...next, holdings }
+          }
+        }
       }
       break
     }
@@ -410,8 +427,8 @@ export function retroactivelyAdjustSnapshots(
         break
       case 'new_position':
         if (tx.symbol && tx.shares && tx.price) {
-          const val = toTwd(tx.shares * tx.price, tx.currency)
-          h[tx.symbol] = direction === 1 ? val : 0
+          const delta = toTwd(tx.shares * tx.price, tx.currency)
+          h[tx.symbol] = (h[tx.symbol] ?? 0) + direction * delta
         }
         break
       case 'transfer':
