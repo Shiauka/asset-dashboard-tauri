@@ -53,7 +53,7 @@ export default function PriceUpdateDialog({ open, onClose, state, onUpdate }: Pr
 
       if (data.exchange_rate !== null) setFx(String(data.exchange_rate))
 
-      const fxStatus = data.exchange_rate !== null ? '台銀匯率 ✓' : '台銀匯率取得失敗'
+      const fxStatus = data.exchange_rate !== null ? 'Yahoo 匯率 ✓' : 'Yahoo 匯率取得失敗'
       const failList = data.errors.length > 0 ? `，${data.errors.join('、')} 失敗` : ''
       setFetchStatus(`已更新 ${updated}/${state.holdings.length} 個股價，${fxStatus}${failList}`)
     } catch {

@@ -10,7 +10,7 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.5.1 | [資產管理儀表板_0.5.1_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.5.1/%E8%B3%87%E7%94%A2%E7%AE%A1%E7%90%86%E5%84%80%E8%A1%A8%E6%9D%BF_0.5.1_x64-setup.exe) |
+| Windows 10 / 11 | v0.5.2 | [資產管理儀表板_0.5.2_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.5.2/%E8%B3%87%E7%94%A2%E7%AE%A1%E7%90%86%E5%84%80%E8%A1%A8%E6%9D%BF_0.5.2_x64-setup.exe) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
@@ -32,7 +32,7 @@
 
 **其他功能：**
 - 總資產同時顯示台幣與折合美元，並按計價幣別拆分「台幣資產 / 美元資產」（原值加總，非全資產折算）
-- 啟動時自動從 Yahoo Finance 抓取最新報價，匯率從台灣銀行牌告匯率取得
+- 啟動時自動從 Yahoo Finance 抓取最新報價與 USD/TWD 匯率
 - 隱藏金額模式（一鍵模糊所有數字）
 - 資料以每日 JSON 快照格式存放在自訂根目錄
 - **稅務紀錄**：績效分析頁顯示已實現損益與股息收入，按年度匯整，附賣出明細（均攤成本、賣出價、損益金額）

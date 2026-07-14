@@ -747,6 +747,18 @@ pub struct HoldingInput {
     pub currency: String,
 }
 
+async fn yahoo_price(client: &reqwest::Client, symbol: &str) -> Option<f64> {
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d",
+        symbol
+    );
+    let r = client.get(&url).send().await.ok()?;
+    if !r.status().is_success() { return None; }
+    let d: serde_json::Value = r.json().await.ok()?;
+    let p = d["chart"]["result"][0]["meta"]["regularMarketPrice"].as_f64()?;
+    if p > 0.0 { Some(p) } else { None }
+}
+
 #[tauri::command]
 async fn fetch_prices(holdings: Vec<HoldingInput>) -> serde_json::Value {
     let client = reqwest::Client::builder()
@@ -774,18 +786,7 @@ async fn fetch_prices(holdings: Vec<HoldingInput>) -> serde_json::Value {
             };
             let mut price: Option<f64> = None;
             for ys in &candidates {
-                let url = format!(
-                    "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=1d",
-                    ys
-                );
-                let p: Option<f64> = async {
-                    let r = c.get(&url).send().await.ok()?;
-                    if !r.status().is_success() { return None; }
-                    let d: serde_json::Value = r.json().await.ok()?;
-                    let pp = d["chart"]["result"][0]["meta"]["regularMarketPrice"].as_f64()?;
-                    if pp > 0.0 { Some(pp) } else { None }
-                }
-                .await;
+                let p = yahoo_price(&c, ys).await;
                 if p.is_some() {
                     price = p;
                     break;
@@ -796,36 +797,7 @@ async fn fetch_prices(holdings: Vec<HoldingInput>) -> serde_json::Value {
     }
 
     let rate_c = client.clone();
-    let rate_handle = tokio::spawn(async move {
-        let html = rate_c
-            .get("https://rate.bot.com.tw/xrt?Lang=zh-TW")
-            .send()
-            .await
-            .ok()?
-            .text()
-            .await
-            .ok()?;
-
-        let usd_tr = html.split("<tr").find(|b| b.contains("(USD)"))?.to_string();
-
-        let mut nums: Vec<f64> = Vec::new();
-        let mut pos = 0usize;
-        loop {
-            let rest = &usd_tr[pos..];
-            let Some(td_off) = rest.find("<td") else { break };
-            let from_td = &rest[td_off..];
-            let Some(gt) = from_td.find('>') else { break };
-            let cs = pos + td_off + gt + 1;
-            if cs >= usd_tr.len() { break; }
-            let Some(end_td) = usd_tr[cs..].find("</td>") else { break };
-            let content = usd_tr[cs..cs + end_td].trim();
-            if let Ok(v) = content.parse::<f64>() {
-                if v > 0.0 { nums.push(v); }
-            }
-            pos = cs + end_td + 5;
-        }
-        nums.get(2).copied()
-    });
+    let rate_handle = tokio::spawn(async move { yahoo_price(&rate_c, "TWD=X").await });
 
     let mut prices: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut errors: Vec<String> = Vec::new();
