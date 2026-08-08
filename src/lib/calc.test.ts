@@ -135,6 +135,44 @@ describe('assetsByCurrency', () => {
   })
 })
 
+// ── computeNewMoneyAllocation：防禦桶提領（defensiveDrawTwd）───────────────────
+// 防禦桶（現金/SGOV）本來就是流動資產，超出目標甚至目標內多出的一筆錢，使用者
+// 可能想主動提領出來當新資金分配到其他桶，而不必真的「賣出」任何東西。
+describe('computeNewMoneyAllocation — 防禦桶提領（defensiveDrawTwd）', () => {
+  it('提領金額會從防禦列現值扣除，且不改變 new_total_twd（提領不是外部新資金）', () => {
+    const s = baseState()
+    const withoutDraw = computeNewMoneyAllocation(s, 100000)
+    const withDraw = computeNewMoneyAllocation(s, 100000, 50000)
+    const defWithout = withoutDraw.rows.find(r => r.is_defensive)!
+    const defWith = withDraw.rows.find(r => r.is_defensive)!
+    expect(defWith.current_value_twd).toBeCloseTo(defWithout.current_value_twd - 50000, 6)
+    expect(withDraw.new_total_twd).toBe(withoutDraw.new_total_twd)
+  })
+
+  it('提領金額併入資金池，其他桶缺口夠大時會分到更多錢', () => {
+    const s = baseState()
+    const tiny = computeNewMoneyAllocation(s, 10)
+    const withDraw = computeNewMoneyAllocation(s, 10, 50000)
+    const distributed = (r: typeof tiny) => r.rows.reduce((sum, x) => sum + x.buy_amount_twd, 0)
+    expect(distributed(withDraw)).toBeGreaterThan(distributed(tiny))
+  })
+
+  it('提領後防禦桶低於自己目標時，資金池會自動補一部分回防禦桶（不會被提到目標以下，除非資金池不夠）', () => {
+    const s = baseState()
+    const result = computeNewMoneyAllocation(s, 10, 300000) // 防禦桶現值遠超這個提領量的目標門檻
+    const defRow = result.rows.find(r => r.is_defensive)!
+    expect(defRow.is_overweight).toBe(false)
+    expect(defRow.buy_amount_twd).toBeGreaterThan(0)
+  })
+
+  it('提領金額超過防禦桶現有餘額時會被夾住在 0，不會變成負值', () => {
+    const s = baseState()
+    const result = computeNewMoneyAllocation(s, 0, 999_999_999)
+    const defRow = result.rows.find(r => r.is_defensive)!
+    expect(defRow.current_value_twd).toBeCloseTo(0, 4)
+  })
+})
+
 // ── budget sync 邊界：transfer / 缺 currency 不應污染 TWR ──────────────────────
 // computeTWR 只把 cash_in/cash_out 當外部現金流；transfer/buy/sell 應被忽略。
 // 記帳同步進來的交易可能缺 currency 欄位，需 fallback TWD 不崩潰。

@@ -132,10 +132,39 @@ export default function Dashboard() {
     init()
   }, [commit])
 
-  const saveToDb = useCallback((next: AppState): Promise<void> => {
-    if (!dbRootDir) return Promise.resolve()
-    return invoke('save_snapshot', { state: next }).then(() => {}).catch(() => {})
-  }, [dbRootDir])
+  // 存檔前先跟帳務管家最新資料重新比對一次（refresh_budget_sync），有變更就先
+  // commit 合併後的 state 再存檔 —— 避免看板開著沒重啟時，用記憶體裡的舊
+  // cash_accounts 把帳務管家同一時間新增的異動蓋掉。
+  const saveToDb = useCallback(async (next: AppState): Promise<void> => {
+    if (!dbRootDir) return
+    let toSave = next
+    try {
+      const body = await invoke<{ changed?: boolean; state?: AppState }>('refresh_budget_sync', { state: next })
+      if (body.changed && body.state) {
+        toSave = body.state
+        commit(toSave)
+      }
+    } catch {}
+    await invoke('save_snapshot', { state: toSave }).catch(() => {})
+  }, [dbRootDir, commit])
+
+  // 切回這個視窗時自動重新比對一次帳務管家資料，不用等重開 App 或手動按「匯入」。
+  // saveToDb 內建 refresh_budget_sync 自我修復，沒有變更就只是多寫一次同樣內容。
+  const stateRef = useRef<AppState | null>(null)
+  useEffect(() => { stateRef.current = state }, [state])
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return
+    let unlisten: (() => void) | undefined
+    let disposed = false
+    import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
+      if (disposed) return
+      getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+        if (focused && dbRootDir && stateRef.current) void saveToDb(stateRef.current)
+      }).then(fn => { unlisten = fn })
+    }).catch(() => {})
+    return () => { disposed = true; unlisten?.() }
+  }, [dbRootDir, saveToDb])
 
   const reloadDbSnapshots = useCallback(async (base: AppState): Promise<AppState> => {
     if (!dbRootDir) return base

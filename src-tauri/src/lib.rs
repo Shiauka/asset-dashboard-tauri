@@ -238,6 +238,17 @@ fn compose_note(category: &str, orig: &str) -> serde_json::Value {
     }
 }
 
+fn note_of(tx: &serde_json::Value) -> serde_json::Value {
+    let category  = tx["category"].as_str().unwrap_or("");
+    let orig_note = tx["note"].as_str().unwrap_or("");
+    compose_note(category, orig_note)
+}
+
+fn bank_of(tx: &serde_json::Value, acc_map: &HashMap<String, (String, String)>) -> Option<(String, String)> {
+    let aid = tx["account_id"].as_str().unwrap_or("");
+    acc_map.get(aid).cloned()
+}
+
 /// 在現有看板交易中，找出對應某個 budget tx id 的位置。
 /// 同時比對 budget_tx_id（轉帳 expense 側 / 一般交易）與 budget_tx_id_pair（轉帳 income 側）。
 fn find_dash_pos_for_budget(dash_txs: &[serde_json::Value], budget_id: &str) -> Option<usize> {
@@ -247,32 +258,27 @@ fn find_dash_pos_for_budget(dash_txs: &[serde_json::Value], budget_id: &str) -> 
     })
 }
 
-/// 規劃要新增到看板的交易。
-/// 回傳 (要新增的看板交易, 要記入 synced_ids 的 budget tx id 清單)。
-/// acc_map: budget account_id → (dashboard_bank_name, currency)
-fn plan_budget_syncs(
-    budget_txs: &[serde_json::Value],
-    acc_map: &HashMap<String, (String, String)>,
-    already_synced: &std::collections::HashSet<String>,
-) -> (Vec<serde_json::Value>, Vec<String>) {
-    // 是否為「可同步」的候選交易（共同條件）
-    let is_candidate = |tx: &serde_json::Value| -> bool {
-        let id  = tx["id"].as_str().unwrap_or("");
-        let ty  = tx["type"].as_str().unwrap_or("");
-        let amt = tx["amount"].as_f64().unwrap_or(0.0);
-        let from_dash = tx["synced_from_dashboard"].as_bool() == Some(true);
-        !from_dash
-            && !id.is_empty()
-            && !already_synced.contains(id)
-            && amt > 0.0                                   // B：零金額不同步
-            && (ty == "income" || ty == "expense")
-    };
+/// 是否為「結構上可同步」的候選交易，與是否已經同步過無關（income/expense、金額>0、非來自看板本身）。
+fn is_syncable(tx: &serde_json::Value) -> bool {
+    let id  = tx["id"].as_str().unwrap_or("");
+    let ty  = tx["type"].as_str().unwrap_or("");
+    let amt = tx["amount"].as_f64().unwrap_or(0.0);
+    let from_dash = tx["synced_from_dashboard"].as_bool() == Some(true);
+    !from_dash
+        && !id.is_empty()
+        && amt > 0.0                                   // B：零金額不同步
+        && (ty == "income" || ty == "expense")
+}
 
-    // 依 transfer_id 分組（只看候選交易）
+/// 依 transfer_id 把符合 filter 的候選交易分組。
+fn group_by_transfer<'a>(
+    budget_txs: &'a [serde_json::Value],
+    filter: impl Fn(&serde_json::Value) -> bool,
+) -> (HashMap<String, Vec<&'a serde_json::Value>>, Vec<&'a serde_json::Value>) {
     let mut transfer_groups: HashMap<String, Vec<&serde_json::Value>> = HashMap::new();
     let mut singles: Vec<&serde_json::Value> = Vec::new();
     for tx in budget_txs {
-        if !is_candidate(tx) { continue; }
+        if !filter(tx) { continue; }
         let tid = tx["transfer_id"].as_str().unwrap_or("");
         if tid.is_empty() {
             singles.push(tx);
@@ -280,88 +286,21 @@ fn plan_budget_syncs(
             transfer_groups.entry(tid.to_string()).or_default().push(tx);
         }
     }
-
-    let mut new_txs: Vec<serde_json::Value> = Vec::new();
-    let mut new_ids: Vec<String> = Vec::new();
-
-    let bank_of  = |tx: &serde_json::Value| -> Option<(String, String)> {
-        let aid = tx["account_id"].as_str().unwrap_or("");
-        acc_map.get(aid).cloned()
-    };
-    let note_of = |tx: &serde_json::Value| -> serde_json::Value {
-        let category  = tx["category"].as_str().unwrap_or("");
-        let orig_note = tx["note"].as_str().unwrap_or("");
-        compose_note(category, orig_note)
-    };
-
-    // ── 轉帳群組 ────────────────────────────────────────────────────────────
-    for (_tid, txs) in &transfer_groups {
-        let expense = txs.iter().find(|t| t["type"].as_str() == Some("expense"));
-        let income  = txs.iter().find(|t| t["type"].as_str() == Some("income"));
-
-        match (expense, income) {
-            // A：兩側都對應看板銀行 → 合併成一筆 transfer
-            (Some(exp), Some(inc)) if bank_of(exp).is_some() && bank_of(inc).is_some() => {
-                let (bank,    currency) = bank_of(exp).unwrap();
-                let (bank_to, _)        = bank_of(inc).unwrap();
-                let exp_id = exp["id"].as_str().unwrap_or("").to_string();
-                let inc_id = inc["id"].as_str().unwrap_or("").to_string();
-                let amount    = exp["amount"].as_f64().unwrap_or(0.0);
-                let amount_to = inc["amount"].as_f64().unwrap_or(amount);
-                new_txs.push(serde_json::json!({
-                    "id": format!("budget_{}", exp_id),
-                    "type": "transfer",
-                    "date": exp["date"].as_str().unwrap_or(""),
-                    "bank": bank,
-                    "bank_to": bank_to,
-                    "currency": currency,                  // D
-                    "amount": amount,
-                    "amount_to": amount_to,                // 跨幣別轉帳兩側金額不同
-                    "commission": 0,
-                    "note": note_of(exp),
-                    "budget_tx_id": exp_id,                // C：expense 側
-                    "budget_tx_id_pair": inc_id,           // C：income 側
-                }));
-                new_ids.push(exp_id);
-                new_ids.push(inc_id);                      // 兩個 id 都標記已同步
-            }
-            // 只有 expense 側對應看板 → cash_out
-            (Some(exp), _) if bank_of(exp).is_some() => {
-                push_cash_tx(&mut new_txs, &mut new_ids, exp, &bank_of(exp).unwrap(), note_of(exp));
-            }
-            // 只有 income 側對應看板 → cash_in
-            (_, Some(inc)) if bank_of(inc).is_some() => {
-                push_cash_tx(&mut new_txs, &mut new_ids, inc, &bank_of(inc).unwrap(), note_of(inc));
-            }
-            // 兩側都不對應 → 跳過
-            _ => {}
-        }
-    }
-
-    // ── 非轉帳交易 ──────────────────────────────────────────────────────────
-    for tx in &singles {
-        if let Some(bc) = bank_of(tx) {
-            push_cash_tx(&mut new_txs, &mut new_ids, tx, &bc, note_of(tx));
-        }
-    }
-
-    (new_txs, new_ids)
+    (transfer_groups, singles)
 }
 
-/// 把一筆 budget 收支轉成看板 cash_in/cash_out 並推入結果集。
-fn push_cash_tx(
-    new_txs: &mut Vec<serde_json::Value>,
-    new_ids: &mut Vec<String>,
+/// 把一筆 budget 收支轉成看板 cash_in/cash_out 交易（純函式）。
+fn build_cash_tx(
     tx: &serde_json::Value,
     bank_currency: &(String, String),
     note: serde_json::Value,
-) {
+) -> serde_json::Value {
     let id        = tx["id"].as_str().unwrap_or("").to_string();
     let ty        = tx["type"].as_str().unwrap_or("");
     let amt       = tx["amount"].as_f64().unwrap_or(0.0);
     let (bank, currency) = bank_currency.clone();
     let dash_type = if ty == "income" { "cash_in" } else { "cash_out" };
-    new_txs.push(serde_json::json!({
+    serde_json::json!({
         "id": format!("budget_{}", id),
         "type": dash_type,
         "date": tx["date"].as_str().unwrap_or(""),
@@ -371,8 +310,152 @@ fn push_cash_tx(
         "commission": 0,
         "note": note,
         "budget_tx_id": id,
-    }));
-    new_ids.push(id);
+    })
+}
+
+/// 把一組轉帳配對（expense 側 + income 側都對應看板銀行）合併成一筆看板 transfer 交易（純函式）。
+fn build_transfer_tx(
+    exp: &serde_json::Value,
+    inc: &serde_json::Value,
+    bank: &str,
+    bank_to: &str,
+    currency: &str,
+) -> serde_json::Value {
+    let exp_id    = exp["id"].as_str().unwrap_or("").to_string();
+    let inc_id    = inc["id"].as_str().unwrap_or("").to_string();
+    let amount    = exp["amount"].as_f64().unwrap_or(0.0);
+    let amount_to = inc["amount"].as_f64().unwrap_or(amount);
+    serde_json::json!({
+        "id": format!("budget_{}", exp_id),
+        "type": "transfer",
+        "date": exp["date"].as_str().unwrap_or(""),
+        "bank": bank,
+        "bank_to": bank_to,
+        "currency": currency,                  // D
+        "amount": amount,
+        "amount_to": amount_to,                // 跨幣別轉帳兩側金額不同
+        "commission": 0,
+        "note": note_of(exp),
+        "budget_tx_id": exp_id,                // C：expense 側
+        "budget_tx_id_pair": inc_id,           // C：income 側
+    })
+}
+
+/// 針對「單一轉帳群組」決定要不要同步、同步成什麼樣子（A：兩側合併 / 單側 cash_in|out / 都不對應）。
+/// 回傳 (涉及的 budget id 清單, 查找既有看板紀錄用的 primary id, 產生的看板交易)。
+fn resolve_transfer_group(
+    txs: &[&serde_json::Value],
+    acc_map: &HashMap<String, (String, String)>,
+) -> Option<(Vec<String>, String, serde_json::Value)> {
+    let expense = txs.iter().find(|t| t["type"].as_str() == Some("expense")).copied();
+    let income  = txs.iter().find(|t| t["type"].as_str() == Some("income")).copied();
+
+    match (expense, income) {
+        // A：兩側都對應看板銀行 → 合併成一筆 transfer
+        (Some(exp), Some(inc)) if bank_of(exp, acc_map).is_some() && bank_of(inc, acc_map).is_some() => {
+            let (bank,    currency) = bank_of(exp, acc_map).unwrap();
+            let (bank_to, _)        = bank_of(inc, acc_map).unwrap();
+            let exp_id = exp["id"].as_str().unwrap_or("").to_string();
+            let inc_id = inc["id"].as_str().unwrap_or("").to_string();
+            let want = build_transfer_tx(exp, inc, &bank, &bank_to, &currency);
+            Some((vec![exp_id.clone(), inc_id], exp_id, want))
+        }
+        // 只有 expense 側對應看板 → cash_out
+        (Some(exp), _) if bank_of(exp, acc_map).is_some() => {
+            let bc = bank_of(exp, acc_map).unwrap();
+            let id = exp["id"].as_str().unwrap_or("").to_string();
+            let want = build_cash_tx(exp, &bc, note_of(exp));
+            Some((vec![id.clone()], id, want))
+        }
+        // 只有 income 側對應看板 → cash_in
+        (_, Some(inc)) if bank_of(inc, acc_map).is_some() => {
+            let bc = bank_of(inc, acc_map).unwrap();
+            let id = inc["id"].as_str().unwrap_or("").to_string();
+            let want = build_cash_tx(inc, &bc, note_of(inc));
+            Some((vec![id.clone()], id, want))
+        }
+        // 兩側都不對應 → 跳過
+        _ => None,
+    }
+}
+
+/// 規劃要新增到看板的交易（尚未同步過的候選交易）。
+/// 回傳 (要新增的看板交易, 要記入 synced_ids 的 budget tx id 清單)。
+/// acc_map: budget account_id → (dashboard_bank_name, currency)
+fn plan_budget_syncs(
+    budget_txs: &[serde_json::Value],
+    acc_map: &HashMap<String, (String, String)>,
+    already_synced: &std::collections::HashSet<String>,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let is_new_candidate = |tx: &serde_json::Value| -> bool {
+        is_syncable(tx) && !already_synced.contains(tx["id"].as_str().unwrap_or(""))
+    };
+    let (transfer_groups, singles) = group_by_transfer(budget_txs, is_new_candidate);
+
+    let mut new_txs: Vec<serde_json::Value> = Vec::new();
+    let mut new_ids: Vec<String> = Vec::new();
+
+    // ── 轉帳群組 ────────────────────────────────────────────────────────────
+    for (_tid, txs) in &transfer_groups {
+        if let Some((ids, _primary, want)) = resolve_transfer_group(txs, acc_map) {
+            new_txs.push(want);
+            new_ids.extend(ids);
+        }
+    }
+
+    // ── 非轉帳交易 ──────────────────────────────────────────────────────────
+    for tx in &singles {
+        if let Some(bc) = bank_of(tx, acc_map) {
+            let id = tx["id"].as_str().unwrap_or("").to_string();
+            new_txs.push(build_cash_tx(tx, &bc, note_of(tx)));
+            new_ids.push(id);
+        }
+    }
+
+    (new_txs, new_ids)
+}
+
+/// 針對「已經同步過、但 budget 端內容已變更」的交易，規劃看板端要更新成什麼樣子。
+/// 只處理仍是候選交易（income/expense、金額>0、帳戶仍對應看板銀行）且能在 dash_txs 中
+/// 找到既有對應紀錄的情況；回傳 (dash_txs 內要更新的 index, 新的看板交易)。
+/// 新增/刪除交由 plan_budget_syncs / 刪除偵測處理，這裡只處理「內容不一樣就換掉」
+/// （例如編輯金額、日期、分類/備註、轉帳的對應帳戶）。
+fn plan_budget_updates(
+    budget_txs: &[serde_json::Value],
+    acc_map: &HashMap<String, (String, String)>,
+    already_synced: &std::collections::HashSet<String>,
+    dash_txs: &[serde_json::Value],
+) -> Vec<(usize, serde_json::Value)> {
+    let is_existing_candidate = |tx: &serde_json::Value| -> bool {
+        is_syncable(tx) && already_synced.contains(tx["id"].as_str().unwrap_or(""))
+    };
+    let (transfer_groups, singles) = group_by_transfer(budget_txs, is_existing_candidate);
+
+    let mut updates: Vec<(usize, serde_json::Value)> = Vec::new();
+
+    for (_tid, txs) in &transfer_groups {
+        if let Some((_ids, primary, want)) = resolve_transfer_group(txs, acc_map) {
+            if let Some(pos) = find_dash_pos_for_budget(dash_txs, &primary) {
+                if dash_txs[pos] != want {
+                    updates.push((pos, want));
+                }
+            }
+        }
+    }
+
+    for tx in &singles {
+        if let Some(bc) = bank_of(tx, acc_map) {
+            let id = tx["id"].as_str().unwrap_or("").to_string();
+            let want = build_cash_tx(tx, &bc, note_of(tx));
+            if let Some(pos) = find_dash_pos_for_budget(dash_txs, &id) {
+                if dash_txs[pos] != want {
+                    updates.push((pos, want));
+                }
+            }
+        }
+    }
+
+    updates
 }
 
 // ── Migration: move legacy YYYY-MM-DD.json → snapshots/YYYY-MM.json ──────────
@@ -449,6 +532,160 @@ fn set_db_config(app: AppHandle, root_dir: Option<String>) -> Result<(), String>
     std::fs::write(&path, json).map_err(|e| e.to_string())
 }
 
+// ── Shared: budget → dashboard cash-transaction sync ────────────────────────
+// 把 budget.json / sync.json / budget/ 月份交易跟 merged["transactions"] 比對，
+// 新增/刪除/更新同步到 merged 上（含 apply_delta 調整 cash_accounts），有變更
+// 就把新的 transactions.json / sync.json 寫回磁碟。回傳是否有變更。
+//
+// 抽成獨立函式讓 load_snapshots（App 啟動時）跟 refresh_budget_sync（存檔前 /
+// 視窗取得焦點時）共用同一套邏輯 —— 原本只有啟動時跑一次，若看板開著不重啟，
+// 期間帳務管家新增的交易永遠不會被看見，甚至會被之後的 save_snapshot 用記憶體
+// 裡的舊資料覆蓋掉。
+async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) -> bool {
+    let tx_path     = PathBuf::from(root_dir).join("transactions.json");
+    let budget_path = PathBuf::from(root_dir).join("budget.json");
+    let sync_path   = PathBuf::from(root_dir).join("sync.json");
+
+    if !budget_path.exists() { return false; }
+
+    let (b_raw, s_raw_or_default) = match (
+        tokio::fs::read_to_string(&budget_path).await,
+        tokio::fs::read_to_string(&sync_path).await
+            .or_else(|_| Ok::<String, std::io::Error>("{}".to_string())),
+    ) {
+        (Ok(b), Ok(s)) => (b, s),
+        _ => return false,
+    };
+
+    let (budget, sync) = match (
+        serde_json::from_str::<serde_json::Value>(&b_raw),
+        serde_json::from_str::<serde_json::Value>(&s_raw_or_default),
+    ) {
+        (Ok(b), Ok(s)) => (b, s),
+        _ => return false,
+    };
+
+    // 讀取所有 budget 交易：優先 budget/ 月份資料夾，fallback 舊格式 budget.json
+    let budget_tx_dir = PathBuf::from(root_dir).join("budget");
+    let budget_transactions: Vec<serde_json::Value> = if budget_tx_dir.exists() {
+        let mut all = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(&budget_tx_dir).await {
+            let mut mfs: Vec<String> = Vec::new();
+            while let Ok(Some(e)) = rd.next_entry().await {
+                let name = e.file_name().to_string_lossy().to_string();
+                if is_month_file(&name) { mfs.push(name); }
+            }
+            for mf in mfs {
+                if let Ok(raw) = tokio::fs::read_to_string(budget_tx_dir.join(&mf)).await {
+                    if let Ok(txs) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+                        all.extend(txs);
+                    }
+                }
+            }
+        }
+        all
+    } else {
+        // 舊格式 fallback
+        budget["transactions"].as_array().cloned().unwrap_or_default()
+    };
+
+    // 共用工作集：提前取出，刪除和新增都會修改
+    let mut dash_txs: Vec<serde_json::Value> = merged["transactions"]
+        .as_array().cloned().unwrap_or_default();
+    let mut synced_ids: Vec<String> = sync["budget_to_dashboard"]
+        .as_array().cloned().unwrap_or_default()
+        .iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    let mut changed = false;
+
+    // budget 目前存在的所有 transaction id
+    let current_budget_ids: std::collections::HashSet<String> = budget_transactions
+        .iter()
+        .filter_map(|tx| tx["id"].as_str().map(String::from))
+        .collect();
+
+    // Map: budget account_id → (dashboard_bank_name, currency)
+    let acc_map: std::collections::HashMap<String, (String, String)> = budget["accounts"]
+        .as_array().cloned().unwrap_or_default()
+        .iter().filter_map(|a| {
+            let id       = a["id"].as_str()?.to_string();
+            let bank     = a["dashboard_bank_name"].as_str()?.to_string();
+            let currency = a["currency"].as_str().unwrap_or("TWD").to_string();
+            if bank.is_empty() { return None; }
+            Some((id, (bank, currency)))
+        }).collect();
+
+    // ── 1. 刪除偵測：已 sync 但 budget 中已不存在 → 從看板移除 ─────────
+    // 用 find_dash_pos_for_budget 同時比對 budget_tx_id 與 budget_tx_id_pair，
+    // 因此刪掉轉帳任一側都能找到那筆合併的 transfer 並一起清掉兩個 id。
+    let deleted_ids: Vec<String> = synced_ids.iter()
+        .filter(|id| !current_budget_ids.contains(*id))
+        .cloned()
+        .collect();
+
+    for del_id in &deleted_ids {
+        if let Some(pos) = find_dash_pos_for_budget(&dash_txs, del_id) {
+            let removed = dash_txs.remove(pos);
+            // 反向還原現金帳戶金額
+            apply_delta(merged, &removed, -1.0);
+            // 同時把這筆看板交易引用的兩個 budget id 都移出 synced
+            let main_id = removed["budget_tx_id"].as_str().map(String::from);
+            let pair_id = removed["budget_tx_id_pair"].as_str().map(String::from);
+            synced_ids.retain(|id| {
+                Some(id) != main_id.as_ref() && Some(id) != pair_id.as_ref()
+            });
+            changed = true;
+        } else {
+            synced_ids.retain(|id| id != del_id);
+        }
+    }
+
+    // ── 1.5 更新偵測：已 sync 但 budget 端內容已變更 → 更新看板端 ──────
+    // （原本只處理新增/刪除，編輯已同步過的交易金額/日期/分類/帳戶都不會反映到看板，
+    //   這裡補上「內容不一樣就換掉」，並用 apply_delta 反向/正向修正現金餘額）
+    {
+        let synced_before_update: std::collections::HashSet<String> =
+            synced_ids.iter().cloned().collect();
+        let updates = plan_budget_updates(
+            &budget_transactions, &acc_map, &synced_before_update, &dash_txs,
+        );
+        for (pos, want_tx) in updates {
+            apply_delta(merged, &dash_txs[pos], -1.0);
+            apply_delta(merged, &want_tx, 1.0);
+            dash_txs[pos] = want_tx;
+            changed = true;
+        }
+    }
+
+    // ── 2. 新增：尚未 sync 的 budget 交易 → 加到看板 ─────────────────
+    let already_synced: std::collections::HashSet<String> =
+        synced_ids.iter().cloned().collect();
+
+    // 純函式規劃：轉帳合併(A)、零金額過濾(B)、配對記錄(C)、currency 必帶(D)
+    let (new_txs, new_ids) =
+        plan_budget_syncs(&budget_transactions, &acc_map, &already_synced);
+    for new_tx in new_txs {
+        apply_delta(merged, &new_tx, 1.0);
+        dash_txs.push(new_tx);
+        changed = true;
+    }
+    synced_ids.extend(new_ids);
+
+    // ── 3. 有變更才寫檔 ───────────────────────────────────────────
+    if changed {
+        merged["transactions"] = serde_json::json!(dash_txs);
+        if let Ok(j) = serde_json::to_string_pretty(&merged["transactions"]) {
+            let _ = tokio::fs::write(&tx_path, j).await;
+        }
+        let mut merged_sync = sync.clone();
+        merged_sync["budget_to_dashboard"] = serde_json::json!(synced_ids);
+        if let Ok(j) = serde_json::to_string_pretty(&merged_sync) {
+            let _ = tokio::fs::write(&sync_path, j).await;
+        }
+    }
+
+    changed
+}
+
 #[tauri::command]
 async fn load_snapshots(app: AppHandle) -> serde_json::Value {
     let root_dir = match get_root_dir(&app) {
@@ -521,122 +758,8 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
         }
     }
 
-    // ── Optional: sync cash transactions from budget tracker ──────────────────
-    let budget_path = PathBuf::from(&root_dir).join("budget.json");
-    let sync_path   = PathBuf::from(&root_dir).join("sync.json");
-    if budget_path.exists() {
-        if let (Ok(b_raw), Ok(s_raw_or_default)) = (
-            tokio::fs::read_to_string(&budget_path).await,
-            tokio::fs::read_to_string(&sync_path).await
-                .or_else(|_| Ok::<String, std::io::Error>("{}".to_string())),
-        ) {
-            if let (Ok(budget), Ok(sync)) = (
-                serde_json::from_str::<serde_json::Value>(&b_raw),
-                serde_json::from_str::<serde_json::Value>(&s_raw_or_default),
-            ) {
-                // 讀取所有 budget 交易：優先 budget/ 月份資料夾，fallback 舊格式 budget.json
-                let budget_tx_dir = PathBuf::from(&root_dir).join("budget");
-                let budget_transactions: Vec<serde_json::Value> = if budget_tx_dir.exists() {
-                    let mut all = Vec::new();
-                    if let Ok(mut rd) = tokio::fs::read_dir(&budget_tx_dir).await {
-                        let mut mfs: Vec<String> = Vec::new();
-                        while let Ok(Some(e)) = rd.next_entry().await {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if is_month_file(&name) { mfs.push(name); }
-                        }
-                        for mf in mfs {
-                            if let Ok(raw) = tokio::fs::read_to_string(budget_tx_dir.join(&mf)).await {
-                                if let Ok(txs) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
-                                    all.extend(txs);
-                                }
-                            }
-                        }
-                    }
-                    all
-                } else {
-                    // 舊格式 fallback
-                    budget["transactions"].as_array().cloned().unwrap_or_default()
-                };
-                // 共用工作集：提前取出，刪除和新增都會修改
-                let mut dash_txs: Vec<serde_json::Value> = merged["transactions"]
-                    .as_array().cloned().unwrap_or_default();
-                let mut synced_ids: Vec<String> = sync["budget_to_dashboard"]
-                    .as_array().cloned().unwrap_or_default()
-                    .iter().filter_map(|v| v.as_str().map(String::from)).collect();
-                let mut changed = false;
-
-                // budget 目前存在的所有 transaction id
-                let current_budget_ids: std::collections::HashSet<String> = budget_transactions
-                    .iter()
-                    .filter_map(|tx| tx["id"].as_str().map(String::from))
-                    .collect();
-
-                // ── 1. 刪除偵測：已 sync 但 budget 中已不存在 → 從看板移除 ─────────
-                // 用 find_dash_pos_for_budget 同時比對 budget_tx_id 與 budget_tx_id_pair，
-                // 因此刪掉轉帳任一側都能找到那筆合併的 transfer 並一起清掉兩個 id。
-                let deleted_ids: Vec<String> = synced_ids.iter()
-                    .filter(|id| !current_budget_ids.contains(*id))
-                    .cloned()
-                    .collect();
-
-                for del_id in &deleted_ids {
-                    if let Some(pos) = find_dash_pos_for_budget(&dash_txs, del_id) {
-                        let removed = dash_txs.remove(pos);
-                        // 反向還原現金帳戶金額
-                        apply_delta(&mut merged, &removed, -1.0);
-                        // 同時把這筆看板交易引用的兩個 budget id 都移出 synced
-                        let main_id = removed["budget_tx_id"].as_str().map(String::from);
-                        let pair_id = removed["budget_tx_id_pair"].as_str().map(String::from);
-                        synced_ids.retain(|id| {
-                            Some(id) != main_id.as_ref() && Some(id) != pair_id.as_ref()
-                        });
-                        changed = true;
-                    } else {
-                        synced_ids.retain(|id| id != del_id);
-                    }
-                }
-
-                // ── 2. 新增：尚未 sync 的 budget 交易 → 加到看板 ─────────────────
-                let already_synced: std::collections::HashSet<String> =
-                    synced_ids.iter().cloned().collect();
-
-                // Map: budget account_id → (dashboard_bank_name, currency)
-                let acc_map: std::collections::HashMap<String, (String, String)> = budget["accounts"]
-                    .as_array().cloned().unwrap_or_default()
-                    .iter().filter_map(|a| {
-                        let id       = a["id"].as_str()?.to_string();
-                        let bank     = a["dashboard_bank_name"].as_str()?.to_string();
-                        let currency = a["currency"].as_str().unwrap_or("TWD").to_string();
-                        if bank.is_empty() { return None; }
-                        Some((id, (bank, currency)))
-                    }).collect();
-
-                // 純函式規劃：轉帳合併(A)、零金額過濾(B)、配對記錄(C)、currency 必帶(D)
-                let (new_txs, new_ids) =
-                    plan_budget_syncs(&budget_transactions, &acc_map, &already_synced);
-                for new_tx in new_txs {
-                    apply_delta(&mut merged, &new_tx, 1.0);
-                    dash_txs.push(new_tx);
-                    changed = true;
-                }
-                synced_ids.extend(new_ids);
-
-                // ── 3. 有變更才寫檔 ───────────────────────────────────────────
-                if changed {
-                    merged["transactions"] = serde_json::json!(dash_txs);
-                    if let Ok(j) = serde_json::to_string_pretty(&merged["transactions"]) {
-                        let _ = tokio::fs::write(&tx_path, j).await;
-                    }
-                    let mut merged_sync = sync.clone();
-                    merged_sync["budget_to_dashboard"] = serde_json::json!(synced_ids);
-                    if let Ok(j) = serde_json::to_string_pretty(&merged_sync) {
-                        let _ = tokio::fs::write(&sync_path, j).await;
-                    }
-                }
-            }
-        }
-    }
-    // ── End budget sync ───────────────────────────────────────────────────────
+    // ── budget → dashboard 現金交易同步（邏輯見共用函式 sync_budget_into_state）──
+    sync_budget_into_state(&root_dir, &mut merged).await;
 
     serde_json::json!({
         "ok": true,
@@ -682,6 +805,20 @@ async fn save_snapshot(app: AppHandle, state: serde_json::Value) -> Result<serde
     tokio::fs::write(&month_file, json).await.map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({ "ok": true, "date": date }))
+}
+
+// 存檔前 / 視窗取得焦點時呼叫：把前端目前的 state 跟 budget 端最新資料重新比對，
+// 有新增/刪除/更新才回傳 changed:true + 合併後的 state，避免看板長時間開著、
+// 帳務管家那邊的異動要等重開看板才會被看到（甚至被下一次 save_snapshot 蓋掉）。
+#[tauri::command]
+async fn refresh_budget_sync(app: AppHandle, state: serde_json::Value) -> serde_json::Value {
+    let root_dir = match get_root_dir(&app) {
+        Some(d) => d,
+        None => return serde_json::json!({ "changed": false, "state": state }),
+    };
+    let mut merged = state;
+    let changed = sync_budget_into_state(&root_dir, &mut merged).await;
+    serde_json::json!({ "changed": changed, "state": merged })
 }
 
 #[tauri::command]
@@ -865,6 +1002,7 @@ pub fn run() {
             set_db_config,
             load_snapshots,
             save_snapshot,
+            refresh_budget_sync,
             retroactive_update,
             fetch_prices,
             open_url,
@@ -1120,5 +1258,88 @@ mod tests {
         // 用 income 側 id 也要找得到那筆 transfer
         assert_eq!(find_dash_pos_for_budget(&dash, "i1"), Some(1));
         assert_eq!(find_dash_pos_for_budget(&dash, "nope"), None);
+    }
+
+    // ── plan_budget_updates：已同步交易被編輯後要更新看板端 ──────────────────
+
+    // 21：修改金額 → 應該產生一筆 update
+    #[test]
+    fn update_detects_amount_change() {
+        let budget = vec![tx("e1", "expense", "a1", 800.0)]; // budget 端已改成 800
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let dash = vec![serde_json::json!({
+            "id": "budget_e1", "type": "cash_out", "date": "2026-06-09",
+            "bank": "富邦 台幣現金", "currency": "TWD", "amount": 500.0,
+            "commission": 0, "note": serde_json::Value::Null, "budget_tx_id": "e1",
+        })]; // 看板端還停在舊的 500
+        let updates = plan_budget_updates(&budget, &map, &synced(&["e1"]), &dash);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 0);
+        assert_eq!(updates[0].1["amount"], 800.0);
+    }
+
+    // 22：內容完全沒變 → 不產生 update
+    #[test]
+    fn update_no_change_returns_empty() {
+        let budget = vec![tx("e1", "expense", "a1", 500.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let dash = vec![serde_json::json!({
+            "id": "budget_e1", "type": "cash_out", "date": "2026-06-09",
+            "bank": "富邦 台幣現金", "currency": "TWD", "amount": 500.0,
+            "commission": 0, "note": serde_json::Value::Null, "budget_tx_id": "e1",
+        })];
+        let updates = plan_budget_updates(&budget, &map, &synced(&["e1"]), &dash);
+        assert!(updates.is_empty());
+    }
+
+    // 23：尚未同步過的交易不歸這個函式管（那是 plan_budget_syncs 的工作）
+    #[test]
+    fn update_ignores_not_yet_synced() {
+        let budget = vec![tx("e1", "expense", "a1", 800.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let updates = plan_budget_updates(&budget, &map, &synced(&[]), &[]);
+        assert!(updates.is_empty());
+    }
+
+    // 24：改日期 → 也要抓到
+    #[test]
+    fn update_detects_date_change() {
+        let mut t = tx("e1", "expense", "a1", 500.0);
+        t["date"] = serde_json::json!("2026-07-01");
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let dash = vec![serde_json::json!({
+            "id": "budget_e1", "type": "cash_out", "date": "2026-06-09",
+            "bank": "富邦 台幣現金", "currency": "TWD", "amount": 500.0,
+            "commission": 0, "note": serde_json::Value::Null, "budget_tx_id": "e1",
+        })];
+        let updates = plan_budget_updates(&[t], &map, &synced(&["e1"]), &dash);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1["date"], "2026-07-01");
+    }
+
+    // 25：轉帳金額被改 → 合併後的 transfer 也要更新
+    #[test]
+    fn update_detects_transfer_amount_change() {
+        let budget = transfer_pair("e1", "a1", 50000.0, "i1", "a2", 50000.0, "t1"); // 改成 50000
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD"), ("a2", "元大 台幣現金", "TWD")]);
+        let dash = vec![serde_json::json!({
+            "id": "budget_e1", "type": "transfer", "date": "2026-06-09",
+            "bank": "富邦 台幣現金", "bank_to": "元大 台幣現金", "currency": "TWD",
+            "amount": 40000.0, "amount_to": 40000.0, "commission": 0,
+            "note": serde_json::Value::Null, "budget_tx_id": "e1", "budget_tx_id_pair": "i1",
+        })]; // 看板端還停在舊的 40000
+        let updates = plan_budget_updates(&budget, &map, &synced(&["e1", "i1"]), &dash);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].1["amount"], 50000.0);
+        assert_eq!(updates[0].1["amount_to"], 50000.0);
+    }
+
+    // 26：已同步但看板端找不到對應紀錄（不該發生，但要防呆不崩潰/不亂加）
+    #[test]
+    fn update_missing_dash_entry_returns_nothing() {
+        let budget = vec![tx("e1", "expense", "a1", 800.0)];
+        let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
+        let updates = plan_budget_updates(&budget, &map, &synced(&["e1"]), &[]);
+        assert!(updates.is_empty());
     }
 }

@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import type { AppState } from '@/lib/types'
-import { computeNewMoneyAllocation, totalAssetsTwd } from '@/lib/calc'
+import { computeNewMoneyAllocation, totalAssetsTwd, defensiveBucketValueTwd } from '@/lib/calc'
 
 const fmt = (n: number, d = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n)
@@ -19,6 +19,7 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
 }) {
   const [amount, setAmount]     = useState('')
   const [currency, setCurrency] = useState<'TWD' | 'USD'>('TWD')
+  const [drawStr, setDrawStr]   = useState('')
   const [submitted, setSubmitted] = useState(false)
 
   // 偏離警示門檻：本地字串狀態讓輸入流暢，輸入合法時才寫回 state。
@@ -40,18 +41,31 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
     return currency === 'USD' ? n * state.exchange_rate : n
   }, [amount, currency, state.exchange_rate])
 
+  // 防禦桶（現金/SGOV）目前合計——本身就是流動資產，超出目標甚至目標內的一筆錢，
+  // 使用者可能想主動提領出來當新資金分配，不必真的賣出任何東西。
+  const defensiveAvailableTwd = useMemo(() => defensiveBucketValueTwd(state), [state])
+  const drawTwdRaw = useMemo(() => {
+    const n = parseFloat(drawStr)
+    return isFinite(n) && n > 0 ? n : 0
+  }, [drawStr])
+  const drawTwd = Math.min(drawTwdRaw, defensiveAvailableTwd)
+  const drawCapped = drawTwdRaw > defensiveAvailableTwd
+
+  const poolTwd = newMoneyTwd + drawTwd
+
   const result = useMemo(() => {
-    if (!submitted || newMoneyTwd <= 0) return null
-    return computeNewMoneyAllocation(state, newMoneyTwd)
-  }, [submitted, newMoneyTwd, state])
+    if (!submitted || poolTwd <= 0) return null
+    return computeNewMoneyAllocation(state, newMoneyTwd, drawTwd)
+  }, [submitted, newMoneyTwd, drawTwd, poolTwd, state])
 
   const handleCalculate = () => {
-    if (newMoneyTwd > 0) setSubmitted(true)
+    if (poolTwd > 0) setSubmitted(true)
   }
 
   const handleReset = () => {
     setSubmitted(false)
     setAmount('')
+    setDrawStr('')
   }
 
   const total = totalAssetsTwd(state)
@@ -107,8 +121,27 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
             </span>
           )}
 
-          <Button onClick={handleCalculate} disabled={newMoneyTwd <= 0}>計算分配</Button>
+          <Button onClick={handleCalculate} disabled={poolTwd <= 0}>計算分配</Button>
           {submitted && <Button variant="ghost" size="sm" onClick={handleReset}>重設</Button>}
+        </div>
+
+        {/* ── 從防禦桶提領（現金/SGOV 本身是流動資產，不算賣出）── */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-xs text-muted-foreground whitespace-nowrap">另外從防禦桶提領</span>
+          <Input
+            type="number"
+            min={0}
+            placeholder="0"
+            value={drawStr}
+            onChange={e => { setDrawStr(e.target.value); setSubmitted(false) }}
+            onKeyDown={e => e.key === 'Enter' && handleCalculate()}
+            className="w-36"
+          />
+          <span className="text-xs text-muted-foreground">TWD 一起分配</span>
+          <span className="text-xs text-muted-foreground">
+            （防禦桶目前合計 <B>{fmt(defensiveAvailableTwd / 10000, 1)} 萬</B>
+            {drawCapped && <span className="text-amber-600">，已超過上限，自動取上限值</span>}）
+          </span>
         </div>
 
         {/* ── Result ── */}
@@ -119,11 +152,19 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
               <span className="text-muted-foreground">投入</span>
               <span className="font-semibold text-emerald-600">
                 <B>
-                  {currency === 'USD'
+                  {currency === 'USD' && newMoneyTwd > 0
                     ? `$${fmt(parseFloat(amount), 0)} USD`
                     : `${fmt(newMoneyTwd)} TWD`}
                 </B>
               </span>
+              {drawTwd > 0 && (
+                <>
+                  <span className="text-muted-foreground">+ 防禦桶提領</span>
+                  <span className="font-semibold text-sky-600"><B>{fmt(drawTwd)} TWD</B></span>
+                  <span className="text-muted-foreground">= 資金池</span>
+                  <span className="font-semibold"><B>{fmt(poolTwd)} TWD</B></span>
+                </>
+              )}
               <span className="text-muted-foreground">→ 投入後總資產</span>
               <span className="font-semibold"><B>{fmt(result.new_total_twd / 10000, 1)} 萬 TWD</B></span>
               {result.unallocated_twd > 0 && (
@@ -132,6 +173,11 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
                 </Badge>
               )}
             </div>
+            {drawTwd > 0 && (
+              <p className="text-xs text-muted-foreground">
+                提醒：防禦桶提領是帳戶內部重新分配，不是真的匯入新錢——實際執行時記得把這筆現金從防禦桶（銀行活存/SGOV）轉出去買下面列出的標的。
+              </p>
+            )}
 
             {/* Allocation table */}
             <div className="overflow-x-auto">
@@ -213,7 +259,7 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
                   <tr className="border-t-2 font-semibold text-sm">
                     <td className="py-2 pr-4" colSpan={3}>合計投入</td>
                     <td className="text-right pr-4 text-emerald-600">
-                      <B>+{fmt((newMoneyTwd - result.unallocated_twd) / 10000, 2)} 萬</B>
+                      <B>+{fmt((poolTwd - result.unallocated_twd) / 10000, 2)} 萬</B>
                     </td>
                     <td colSpan={3} />
                   </tr>

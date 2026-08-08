@@ -79,6 +79,19 @@ export function totalAssetsTwd(state: AppState): number {
   return holdingsVal + cashVal
 }
 
+// 防禦大桶合計（防禦持倉 + 所有現金帳戶），TWD 計。rebalanceRows 與
+// computeNewMoneyAllocation 共用，避免兩處算法各自漂移。
+export function defensiveBucketValueTwd(state: AppState): number {
+  const { exchange_rate: fx, holdings, cash_accounts } = state
+  const defHoldingsVal = holdings
+    .filter(h => h.category === 'defensive')
+    .reduce((s, h) => s + holdingValueTwd(h.shares, h.price, h.currency, fx), 0)
+  const cashAccVal = cash_accounts.reduce(
+    (s, c) => s + (c.currency === 'USD' ? c.amount * fx : c.amount), 0,
+  )
+  return defHoldingsVal + cashAccVal
+}
+
 // 按計價幣別拆分資產：台幣資產用台幣原值加總、美元資產用美元原值加總。
 // usdInTwd 是美元資產的台幣折算值，twd + usdInTwd 必然等於 totalAssetsTwd（可對帳）。
 export function assetsByCurrency(state: AppState): { twd: number; usd: number; usdInTwd: number } {
@@ -213,12 +226,7 @@ export function rebalanceRows(state: AppState): RebalanceRow[] {
   }
 
   // 防禦資產大桶（動態 target_pct = 防禦持倉 + 現金帳戶目標加總）
-  const defHoldingsVal = holdings
-    .filter(h => h.category === 'defensive')
-    .reduce((s, h) => s + holdingValueTwd(h.shares, h.price, h.currency, fx), 0)
-  const cashAccVal = state.cash_accounts.reduce((sum, c) =>
-    sum + (c.currency === 'USD' ? c.amount * fx : c.amount), 0)
-  const defensiveTotal = defHoldingsVal + cashAccVal
+  const defensiveTotal = defensiveBucketValueTwd(state)
 
   const defensiveTargetPct =
     holdings.filter(h => h.category === 'defensive').reduce((s, h) => s + h.target_pct, 0) +
@@ -541,13 +549,24 @@ export function computeTaxSummary(transactions: Transaction[], fx: number): TaxS
 // Rebalance assistant: given new money (in TWD), compute how to allocate across holdings.
 // Only buys, never sells. Underweight buckets get filled first; if new money exceeds all gaps,
 // the remainder is reported as unallocated (suggest putting in defensive bucket).
+//
+// defensiveDrawTwd (預設 0)：從防禦桶（現金/SGOV）額外提領出來、一起當新資金分配的金額。
+// 這筆錢不是外部匯入，不會讓總資產變多（newTotal 不含它），但會：
+//   1. 從防禦桶目前餘額扣掉（current_value_twd 反映提領後的餘額，不會雙計）
+//   2. 併入可分配的資金池（跟 newMoneyTwd 一起拿去補其他桶的缺口）
+// 若提領後防禦桶反而低於自己的目標，資金池仍會照原本的缺口優先順序把錢補回去——
+// 不會讓防禦桶被提到低於目標以下（除非資金池本身不夠補）。
 export function computeNewMoneyAllocation(
   state: AppState,
   newMoneyTwd: number,
+  defensiveDrawTwd: number = 0,
 ): AllocationResult {
   const { exchange_rate: fx, holdings, cash_accounts } = state
   const currentTotal = totalAssetsTwd(state)
   const newTotal = currentTotal + newMoneyTwd
+  const defensiveAvailable = defensiveBucketValueTwd(state)
+  const drawClamped = Math.max(0, Math.min(defensiveDrawTwd, defensiveAvailable))
+  const pool = newMoneyTwd + drawClamped
 
   // ── Non-defensive holdings ──
   const defSymbols = new Set(holdings.filter(h => h.category === 'defensive').map(h => h.symbol))
@@ -617,14 +636,8 @@ export function computeNewMoneyAllocation(
              buy_amount_twd, is_defensive: false, is_overweight: raw <= 0 }
   })
 
-  // ── Defensive bucket aggregate ──
-  const defHoldingsVal = holdings
-    .filter(h => h.category === 'defensive')
-    .reduce((s, h) => s + holdingValueTwd(h.shares, h.price, h.currency, fx), 0)
-  const cashAccVal = cash_accounts.reduce(
-    (s, c) => s + (c.currency === 'USD' ? c.amount * fx : c.amount), 0,
-  )
-  const defensiveCurrent = defHoldingsVal + cashAccVal
+  // ── Defensive bucket aggregate（扣掉本次提領，避免雙計）──
+  const defensiveCurrent = defensiveAvailable - drawClamped
   const defensiveTargetPct =
     holdings.filter(h => h.category === 'defensive').reduce((s, h) => s + h.target_pct, 0) +
     cash_accounts.reduce((s, c) => s + (c.target_pct ?? 0), 0)
@@ -643,23 +656,23 @@ export function computeNewMoneyAllocation(
     is_overweight: defensiveOverweight,
   })
 
-  // ── Scale if total gaps exceed new money ──
+  // ── Scale if total gaps exceed the pool（新資金 + 防禦桶提領）──
   const sumGaps = rows.reduce((s, r) => s + r.buy_amount_twd, 0)
   let unallocated_twd = 0
 
   if (sumGaps <= 0) {
     // Everything is overweight — distribute proportionally to target_pct
     for (const r of rows) {
-      r.buy_amount_twd = (r.target_pct / 100) * newMoneyTwd
+      r.buy_amount_twd = (r.target_pct / 100) * pool
       r.is_overweight  = false
     }
-  } else if (sumGaps > newMoneyTwd) {
+  } else if (sumGaps > pool) {
     // Not enough money to fill all gaps → scale proportionally
-    const scale = newMoneyTwd / sumGaps
+    const scale = pool / sumGaps
     for (const r of rows) r.buy_amount_twd = r.buy_amount_twd * scale
   } else {
     // More money than gaps → record remainder as unallocated
-    unallocated_twd = newMoneyTwd - sumGaps
+    unallocated_twd = pool - sumGaps
   }
 
   // ── Compute share counts (rounded to whole shares) ──
@@ -674,7 +687,7 @@ export function computeNewMoneyAllocation(
   }
 
   // ── Recalculate unallocated after rounding down shares ──
-  unallocated_twd = newMoneyTwd - rows.reduce((s, r) => s + r.buy_amount_twd, 0)
+  unallocated_twd = pool - rows.reduce((s, r) => s + r.buy_amount_twd, 0)
 
   // Sort: largest allocation first
   rows.sort((a, b) => b.buy_amount_twd - a.buy_amount_twd)
