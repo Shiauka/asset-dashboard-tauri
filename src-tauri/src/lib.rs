@@ -218,6 +218,71 @@ fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64)
     }
 }
 
+// Patch every already-saved snapshot whose date is in [tx.date, today) with the same
+// delta apply_delta() would apply live. Shared by the manual back-dated-entry command
+// (retroactive_update) and the budget→dashboard sync path (sync_budget_into_state).
+// Before this existed, a synced transaction back-dated to before "today" (e.g. entered
+// into 帳務管家 days after the real transaction date) only patched today's in-memory
+// state — already-saved historical snapshots stayed stale, which made TWR double-count
+// the flow (the snapshot's cash balance hadn't dropped yet, but cfMap already excluded
+// it) and produced a fake NAV spike followed by a fake crash once a later snapshot
+// finally synced the real balance.
+async fn apply_retroactive_delta(
+    root_dir: &str,
+    tx: &serde_json::Value,
+    sign: f64,
+    today: &str,
+) -> Vec<String> {
+    let tx_date = tx["date"].as_str().unwrap_or("").to_string();
+    if tx_date.is_empty() || tx_date.as_str() >= today {
+        return Vec::new();
+    }
+    let snap_dir = PathBuf::from(root_dir).join("snapshots");
+    let tx_month = &tx_date[..7.min(tx_date.len())];
+    let today_month = &today[..7.min(today.len())];
+
+    let month_files: Vec<String> = {
+        let mut v = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(&snap_dir).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_month_file(&name) {
+                    let m = name.trim_end_matches(".json");
+                    if m >= tx_month && m <= today_month {
+                        v.push(name);
+                    }
+                }
+            }
+        }
+        v.sort();
+        v
+    };
+
+    let mut updated: Vec<String> = Vec::new();
+    for mf in &month_files {
+        let path = snap_dir.join(mf);
+        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
+            if let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) {
+                let mut changed = false;
+                for (date, state) in map.iter_mut() {
+                    if date.as_str() >= tx_date.as_str() && date.as_str() < today {
+                        apply_delta(state, tx, sign);
+                        updated.push(date.clone());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+                        let _ = tokio::fs::write(&path, json).await;
+                    }
+                }
+            }
+        }
+    }
+
+    updated
+}
+
 // ── Budget → Dashboard sync planning (pure, no IO) ──────────────────────────
 //
 // 把「記帳管家交易 → 儀表板交易」的決策邏輯抽成純函式，方便單元測試。
@@ -542,6 +607,7 @@ fn set_db_config(app: AppHandle, root_dir: Option<String>) -> Result<(), String>
 // 期間帳務管家新增的交易永遠不會被看見，甚至會被之後的 save_snapshot 用記憶體
 // 裡的舊資料覆蓋掉。
 async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) -> bool {
+    let today = get_taiwan_date();
     let tx_path     = PathBuf::from(root_dir).join("transactions.json");
     let budget_path = PathBuf::from(root_dir).join("budget.json");
     let sync_path   = PathBuf::from(root_dir).join("sync.json");
@@ -627,6 +693,7 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
             let removed = dash_txs.remove(pos);
             // 反向還原現金帳戶金額
             apply_delta(merged, &removed, -1.0);
+            apply_retroactive_delta(root_dir, &removed, -1.0, &today).await;
             // 同時把這筆看板交易引用的兩個 budget id 都移出 synced
             let main_id = removed["budget_tx_id"].as_str().map(String::from);
             let pair_id = removed["budget_tx_id_pair"].as_str().map(String::from);
@@ -650,7 +717,9 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
         );
         for (pos, want_tx) in updates {
             apply_delta(merged, &dash_txs[pos], -1.0);
+            apply_retroactive_delta(root_dir, &dash_txs[pos], -1.0, &today).await;
             apply_delta(merged, &want_tx, 1.0);
+            apply_retroactive_delta(root_dir, &want_tx, 1.0, &today).await;
             dash_txs[pos] = want_tx;
             changed = true;
         }
@@ -665,6 +734,7 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
         plan_budget_syncs(&budget_transactions, &acc_map, &already_synced);
     for new_tx in new_txs {
         apply_delta(merged, &new_tx, 1.0);
+        apply_retroactive_delta(root_dir, &new_tx, 1.0, &today).await;
         dash_txs.push(new_tx);
         changed = true;
     }
@@ -830,51 +900,7 @@ async fn retroactive_update(
     let root_dir = get_root_dir(&app).ok_or("尚未設定根目錄")?;
     let sign: f64 = if direction == Some(-1) { -1.0 } else { 1.0 };
     let today = get_taiwan_date();
-    let tx_date = tx["date"].as_str().unwrap_or("").to_string();
-    let snap_dir = PathBuf::from(&root_dir).join("snapshots");
-
-    let tx_month = &tx_date[..7.min(tx_date.len())];
-    let today_month = &today[..7];
-
-    // Find affected month files
-    let month_files: Vec<String> = {
-        let mut rd = tokio::fs::read_dir(&snap_dir).await.map_err(|e| e.to_string())?;
-        let mut v = Vec::new();
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if is_month_file(&name) {
-                let m = name.trim_end_matches(".json");
-                if m >= tx_month && m <= today_month {
-                    v.push(name);
-                }
-            }
-        }
-        v.sort();
-        v
-    };
-
-    let mut updated: Vec<String> = Vec::new();
-    for mf in &month_files {
-        let path = snap_dir.join(mf);
-        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
-            if let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) {
-                let mut changed = false;
-                for (date, state) in map.iter_mut() {
-                    if date >= &tx_date && date.as_str() < today.as_str() {
-                        apply_delta(state, &tx, sign);
-                        updated.push(date.clone());
-                        changed = true;
-                    }
-                }
-                if changed {
-                    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
-                        let _ = tokio::fs::write(&path, json).await;
-                    }
-                }
-            }
-        }
-    }
-
+    let updated = apply_retroactive_delta(&root_dir, &tx, sign, &today).await;
     Ok(serde_json::json!({ "ok": true, "updated": updated }))
 }
 
@@ -1341,5 +1367,83 @@ mod tests {
         let map = acc_map(&[("a1", "富邦 台幣現金", "TWD")]);
         let updates = plan_budget_updates(&budget, &map, &synced(&["e1"]), &[]);
         assert!(updates.is_empty());
+    }
+
+    // ── Tests: apply_retroactive_delta（回填過去已存快照）──────────────────
+    // 2026-08 實戰踩到的雷：帳務管家記了一筆回填日期早於今天的支出，同步進
+    // sync_budget_into_state 時只改了「今天」的記憶體 state，8/14~8/15 兩天已經
+    // 存檔的快照裡現金餘額沒被回填，NAV 因此假暴漲又假崩跌。
+
+    fn write_month_snapshots(dir: &std::path::Path, month_file: &str, entries: &[(&str, f64)]) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut map = serde_json::Map::new();
+        for (date, cash_amount) in entries {
+            map.insert((*date).to_string(), serde_json::json!({
+                "cash_accounts": [
+                    { "bank": "富邦 台幣現金", "currency": "TWD", "amount": cash_amount }
+                ],
+                "holdings": [],
+            }));
+        }
+        std::fs::write(
+            dir.join(month_file),
+            serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap(),
+        ).unwrap();
+    }
+
+    fn read_cash(dir: &std::path::Path, month_file: &str, date: &str) -> f64 {
+        let raw = std::fs::read_to_string(dir.join(month_file)).unwrap();
+        let map: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        map[date]["cash_accounts"][0]["amount"].as_f64().unwrap()
+    }
+
+    // 27：回填交易日期早於今天多天 → 補丁中間所有快照，今天(含)以後不動
+    #[tokio::test]
+    async fn retroactive_delta_patches_snapshots_between_tx_date_and_today() {
+        let root = std::env::temp_dir()
+            .join(format!("adb_test_{}", std::process::id()))
+            .join("retro_backfill");
+        let snap_dir = root.join("snapshots");
+        write_month_snapshots(&snap_dir, "2026-08.json", &[
+            ("2026-08-13", 1_087_557.38),
+            ("2026-08-14", 1_087_557.38),
+            ("2026-08-15", 1_087_557.38),
+            ("2026-08-18", 342_557.38), // 已經是對的，不該被動到
+        ]);
+
+        let tx = serde_json::json!({
+            "type": "cash_out", "bank": "富邦 台幣現金", "amount": 745_000.0,
+            "date": "2026-08-14",
+        });
+        // sign=+1.0: applying this cash_out for the first time (mirrors the new-sync
+        // path in sync_budget_into_state, not a reversal/deletion).
+        let updated = apply_retroactive_delta(root.to_str().unwrap(), &tx, 1.0, "2026-08-18").await;
+
+        assert_eq!(updated.len(), 2); // 8/14, 8/15
+        assert!((read_cash(&snap_dir, "2026-08.json", "2026-08-13") - 1_087_557.38).abs() < 1e-6);
+        assert!((read_cash(&snap_dir, "2026-08.json", "2026-08-14") - 342_557.38).abs() < 1e-6);
+        assert!((read_cash(&snap_dir, "2026-08.json", "2026-08-15") - 342_557.38).abs() < 1e-6);
+        assert!((read_cash(&snap_dir, "2026-08.json", "2026-08-18") - 342_557.38).abs() < 1e-6);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // 28：交易日期就是今天 → 不回填（今天的快照由當次 save_snapshot 用 live state 寫入）
+    #[tokio::test]
+    async fn retroactive_delta_skips_transactions_dated_today() {
+        let root = std::env::temp_dir()
+            .join(format!("adb_test_{}", std::process::id()))
+            .join("retro_today");
+        let snap_dir = root.join("snapshots");
+        write_month_snapshots(&snap_dir, "2026-08.json", &[("2026-08-18", 342_557.38)]);
+
+        let tx = serde_json::json!({
+            "type": "cash_out", "bank": "富邦 台幣現金", "amount": 100.0,
+            "date": "2026-08-18",
+        });
+        let updated = apply_retroactive_delta(root.to_str().unwrap(), &tx, -1.0, "2026-08-18").await;
+        assert!(updated.is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
