@@ -2,8 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+use tokio::sync::Mutex;
 
 pub mod sync_check;
+
+// 序列化所有會讀取-修改-寫回 snapshots/*.json 的指令，避免多個並發呼叫
+// （app 啟動 fetch_prices 回呼、視窗 focus 觸發的 saveToDb、手動存檔按鈕等）
+// 互相交錯寫入同一個月檔案，造成檔案截斷錯位或彼此覆蓋（2026-08-19 踩雷根治）。
+pub struct SnapshotLock(pub Mutex<()>);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -757,10 +763,11 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
 }
 
 #[tauri::command]
-async fn load_snapshots(app: AppHandle) -> serde_json::Value {
+async fn load_snapshots(app: AppHandle, lock: tauri::State<'_, SnapshotLock>) -> Result<serde_json::Value, String> {
+    let _guard = lock.0.lock().await;
     let root_dir = match get_root_dir(&app) {
         Some(d) => d,
-        None => return serde_json::json!({ "ok": false, "error": "尚未設定根目錄", "dates": [] }),
+        None => return Ok(serde_json::json!({ "ok": false, "error": "尚未設定根目錄", "dates": [] })),
     };
     let dir = PathBuf::from(&root_dir);
     let snap_dir = dir.join("snapshots");
@@ -781,29 +788,36 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
             v.sort();
             v
         }
-        Err(e) => return serde_json::json!({ "ok": false, "error": e.to_string(), "dates": [] }),
+        Err(e) => return Ok(serde_json::json!({ "ok": false, "error": e.to_string(), "dates": [] })),
     };
 
     if month_files.is_empty() {
-        return serde_json::json!({ "ok": false, "error": "根目錄中沒有資料", "dates": [] });
+        return Ok(serde_json::json!({ "ok": false, "error": "根目錄中沒有資料", "dates": [] }));
     }
 
     // Collect all (date, state) pairs across all monthly files, sorted
     let mut all_entries: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut broken_files: Vec<String> = Vec::new();
     for mf in &month_files {
         let path = snap_dir.join(mf);
-        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
-            if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) {
-                for (date, state) in map {
-                    all_entries.push((date, state));
+        match tokio::fs::read_to_string(&path).await {
+            Ok(raw) => match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) {
+                Ok(map) => {
+                    for (date, state) in map {
+                        all_entries.push((date, state));
+                    }
                 }
-            }
+                // 解析失敗（檔案損毀/正在被其他呼叫寫入）：不要靜默丟棄整個月，
+                // 記錄下來讓前端能顯示警告，而不是讓使用者以為那個月的資料本來就不存在。
+                Err(_) => broken_files.push(mf.clone()),
+            },
+            Err(_) => broken_files.push(mf.clone()),
         }
     }
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     if all_entries.is_empty() {
-        return serde_json::json!({ "ok": false, "error": "根目錄中沒有資料", "dates": [] });
+        return Ok(serde_json::json!({ "ok": false, "error": "根目錄中沒有資料", "dates": [] }));
     }
 
     let (latest_date, latest_state) = all_entries.last().unwrap().clone();
@@ -831,16 +845,22 @@ async fn load_snapshots(app: AppHandle) -> serde_json::Value {
     // ── budget → dashboard 現金交易同步（邏輯見共用函式 sync_budget_into_state）──
     sync_budget_into_state(&root_dir, &mut merged).await;
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "ok": true,
         "state": merged,
         "date": latest_date,
         "dates": dates,
-    })
+        "brokenFiles": broken_files,
+    }))
 }
 
 #[tauri::command]
-async fn save_snapshot(app: AppHandle, state: serde_json::Value) -> Result<serde_json::Value, String> {
+async fn save_snapshot(
+    app: AppHandle,
+    state: serde_json::Value,
+    lock: tauri::State<'_, SnapshotLock>,
+) -> Result<serde_json::Value, String> {
+    let _guard = lock.0.lock().await;
     let root_dir = get_root_dir(&app).ok_or("尚未設定根目錄")?;
     let date = get_taiwan_date();
     let dir = PathBuf::from(&root_dir);
@@ -860,14 +880,21 @@ async fn save_snapshot(app: AppHandle, state: serde_json::Value) -> Result<serde
         obj.remove("snapshots");
     }
 
-    // Write into YYYY-MM.json (create or update)
+    // Write into YYYY-MM.json (create or update).
+    // 🔴 讀檔失敗跟解析失敗要分開處理，絕對不能都 unwrap_or_default() 成空 Map——
+    // 「檔案不存在」（新的月份，第一次存檔）才適合預設空 Map；「檔案存在但解析失敗」
+    // （損毀、或正被另一個並發呼叫寫入中）如果也預設成空 Map，會用只含今天一筆的
+    // 資料把整個月已存在的歷史快照覆蓋掉（2026-08-19 踩雷：8月只剩8/19一筆的根因）。
     let month_key = &date[..7];
     let month_file = snap_dir.join(format!("{}.json", month_key));
-    let mut month_map: serde_json::Map<String, serde_json::Value> =
-        tokio::fs::read_to_string(&month_file).await
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    let mut month_map: serde_json::Map<String, serde_json::Value> = match tokio::fs::read_to_string(&month_file).await {
+        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!(
+            "讀取 {} 失敗（檔案可能損毀），為避免覆蓋已有的歷史資料，本次存檔已中止：{}",
+            month_file.display(), e
+        ))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(e) => return Err(format!("讀取 {} 失敗：{}", month_file.display(), e)),
+    };
     month_map.insert(date.clone(), lean);
 
     let json = serde_json::to_string_pretty(&serde_json::Value::Object(month_map))
@@ -881,14 +908,19 @@ async fn save_snapshot(app: AppHandle, state: serde_json::Value) -> Result<serde
 // 有新增/刪除/更新才回傳 changed:true + 合併後的 state，避免看板長時間開著、
 // 帳務管家那邊的異動要等重開看板才會被看到（甚至被下一次 save_snapshot 蓋掉）。
 #[tauri::command]
-async fn refresh_budget_sync(app: AppHandle, state: serde_json::Value) -> serde_json::Value {
+async fn refresh_budget_sync(
+    app: AppHandle,
+    state: serde_json::Value,
+    lock: tauri::State<'_, SnapshotLock>,
+) -> Result<serde_json::Value, String> {
+    let _guard = lock.0.lock().await;
     let root_dir = match get_root_dir(&app) {
         Some(d) => d,
-        None => return serde_json::json!({ "changed": false, "state": state }),
+        None => return Ok(serde_json::json!({ "changed": false, "state": state })),
     };
     let mut merged = state;
     let changed = sync_budget_into_state(&root_dir, &mut merged).await;
-    serde_json::json!({ "changed": changed, "state": merged })
+    Ok(serde_json::json!({ "changed": changed, "state": merged }))
 }
 
 #[tauri::command]
@@ -896,7 +928,9 @@ async fn retroactive_update(
     app: AppHandle,
     tx: serde_json::Value,
     direction: Option<i32>,
+    lock: tauri::State<'_, SnapshotLock>,
 ) -> Result<serde_json::Value, String> {
+    let _guard = lock.0.lock().await;
     let root_dir = get_root_dir(&app).ok_or("尚未設定根目錄")?;
     let sign: f64 = if direction == Some(-1) { -1.0 } else { 1.0 };
     let today = get_taiwan_date();
@@ -1023,6 +1057,7 @@ fn open_url(url: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(SnapshotLock(Mutex::new(())))
         .invoke_handler(tauri::generate_handler![
             get_db_config,
             set_db_config,
