@@ -79,8 +79,43 @@ export function totalAssetsTwd(state: AppState): number {
   return holdingsVal + cashVal
 }
 
-// 防禦大桶合計（防禦持倉 + 所有現金帳戶），TWD 計。rebalanceRows 與
-// computeNewMoneyAllocation 共用，避免兩處算法各自漂移。
+// ── 緊急備用金 ──────────────────────────────────────────────────────────────
+// 一筆釘住的絕對金額，完全不參與配置比例計算：其他資產的目標% 加總仍是 100%，
+// 只是分母改成「可配置資產」＝ 總資產 − 已到位的備用金。
+//
+// ⚠️ 關鍵：這筆錢實際躺在指定的現金帳戶裡，所以除了縮分母，還必須從現金桶的
+// 現值扣掉同一筆。只做前者的話現金桶會虛胖這筆錢，再平衡會反過來叫你賣防禦資產。
+//
+// 未設定（emergency_fund 不存在 / target 為 0 / 沒指定帳戶）時三個函式一律回 0 /
+// 原值，所有下游計算與加入此功能前逐位元相同。
+
+// 認列帳戶的餘額合計（TWD）。指定帳戶不存在就當 0，不會炸。
+export function emergencyFundSourceTwd(state: AppState): number {
+  const ef = state.emergency_fund
+  if (!ef?.account_ids?.length) return 0
+  const fx = state.exchange_rate
+  const ids = new Set(ef.account_ids)
+  return state.cash_accounts
+    .filter(c => ids.has(c.id))
+    .reduce((s, c) => s + (c.currency === 'USD' ? c.amount * fx : c.amount), 0)
+}
+
+// 實際到位的備用金 = min(想備的金額, 認列帳戶真的有的錢)。
+// 帳戶被花掉時自動縮水（而不是算出負的現金桶），缺口交給 UI 顯示警告。
+export function emergencyFundTwd(state: AppState): number {
+  const target = Math.max(0, state.emergency_fund?.target_twd ?? 0)
+  if (target <= 0) return 0
+  return Math.min(target, Math.max(0, emergencyFundSourceTwd(state)))
+}
+
+// 可配置資產 = 總資產 − 已到位的備用金。所有比例計算的分母都用這個，
+// 而「總資產」卡片仍顯示 totalAssetsTwd（完整淨值），兩者刻意分開。
+export function investableTotalTwd(state: AppState): number {
+  return Math.max(0, totalAssetsTwd(state) - emergencyFundTwd(state))
+}
+
+// 防禦大桶合計（防禦持倉 + 所有現金帳戶 − 已到位的備用金），TWD 計。
+// rebalanceRows 與 computeNewMoneyAllocation 共用，避免兩處算法各自漂移。
 export function defensiveBucketValueTwd(state: AppState): number {
   const { exchange_rate: fx, holdings, cash_accounts } = state
   const defHoldingsVal = holdings
@@ -89,7 +124,7 @@ export function defensiveBucketValueTwd(state: AppState): number {
   const cashAccVal = cash_accounts.reduce(
     (s, c) => s + (c.currency === 'USD' ? c.amount * fx : c.amount), 0,
   )
-  return defHoldingsVal + cashAccVal
+  return Math.max(0, defHoldingsVal + cashAccVal - emergencyFundTwd(state))
 }
 
 // 按計價幣別拆分資產：台幣資產用台幣原值加總、美元資產用美元原值加總。
@@ -118,7 +153,9 @@ export function totalTargetPct(state: AppState): number {
 
 export function categorySummaries(state: AppState): CategorySummary[] {
   const { exchange_rate: fx, holdings, cash_accounts } = state
-  const total = totalAssetsTwd(state)
+  // 分母＝可配置資產（已扣掉緊急備用金），這樣各桶 actual_pct 加總才會是 100%
+  const total = investableTotalTwd(state)
+  const reserve = emergencyFundTwd(state)
   const cats = getCategories(state)
   const cashId = cashCategoryId(cats)
 
@@ -134,6 +171,8 @@ export function categorySummaries(state: AppState): CategorySummary[] {
     catValues[cashId] = (catValues[cashId] ?? 0) + (c.currency === 'USD' ? c.amount * fx : c.amount)
     catTargets[cashId] = (catTargets[cashId] ?? 0) + (c.target_pct ?? 0)
   }
+  // 備用金躺在現金帳戶裡，上面那圈已經把它加進現金桶了，這裡扣回來
+  if (reserve > 0) catValues[cashId] = Math.max(0, (catValues[cashId] ?? 0) - reserve)
 
   return cats.map(c => ({
     name: c.name,
@@ -162,13 +201,23 @@ export function categoryDrillDown(state: AppState, cat: Category): DrillItem[] {
     })
   }
   if (isCash) {
+    // 備用金躺在認列帳戶裡但不屬於這個桶，從那些帳戶按比例扣掉，
+    // 這樣 drill-down 各項加總才會等於 categorySummaries 給的桶現值。
+    const reserve = emergencyFundTwd(state)
+    const reserveIds = new Set(state.emergency_fund?.account_ids ?? [])
+    const sourceTotal = emergencyFundSourceTwd(state)
     for (const c of cash_accounts) {
       const parts = c.bank.split(' ')
+      const raw = c.currency === 'USD' ? c.amount * fx : c.amount
+      const deduct =
+        reserve > 0 && sourceTotal > 0 && reserveIds.has(c.id)
+          ? reserve * (raw / sourceTotal)
+          : 0
       items.push({
         id: c.bank,
         symbol: parts[0],
         name: parts.slice(1).join(' ') || '',
-        value_twd: c.currency === 'USD' ? c.amount * fx : c.amount,
+        value_twd: Math.max(0, raw - deduct),
         color: '',
       })
     }
@@ -201,7 +250,8 @@ export function requiredAnnualReturn(pv: number, fv: number, n: number, pmt: num
 
 export function rebalanceRows(state: AppState): RebalanceRow[] {
   const { exchange_rate: fx, holdings } = state
-  const total = totalAssetsTwd(state)
+  // 分母＝可配置資產（已扣掉緊急備用金）；備用金是釘住的絕對金額，不參與比例
+  const total = investableTotalTwd(state)
   const rows: RebalanceRow[] = []
 
   const defSymbols = new Set(holdings.filter(h => h.category === 'defensive').map(h => h.symbol))
@@ -562,7 +612,9 @@ export function computeNewMoneyAllocation(
   defensiveDrawTwd: number = 0,
 ): AllocationResult {
   const { exchange_rate: fx, holdings, cash_accounts } = state
-  const currentTotal = totalAssetsTwd(state)
+  // 分母＝可配置資產（已扣掉緊急備用金）。備用金不是可以拿去配置的錢，
+  // 也不該讓新資金因為它而被要求補到更高的目標金額。
+  const currentTotal = investableTotalTwd(state)
   const newTotal = currentTotal + newMoneyTwd
   const defensiveAvailable = defensiveBucketValueTwd(state)
   const drawClamped = Math.max(0, Math.min(defensiveDrawTwd, defensiveAvailable))

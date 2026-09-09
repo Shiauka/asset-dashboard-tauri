@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   totalAssetsTwd, assetsByCurrency, totalTargetPct, categorySummaries, categoryDrillDown,
   rebalanceRows, computeTWR, computeNewMoneyAllocation, requiredAnnualReturn,
+  emergencyFundTwd, emergencyFundSourceTwd, investableTotalTwd, defensiveBucketValueTwd,
 } from './calc'
 import type { AppState, Category } from './types'
 
@@ -216,5 +217,96 @@ describe('computeTWR — budget sync 邊界場景', () => {
     const r = computeTWR(SNAPS, txs, 32)
     expect(r).not.toBeNull()
     expect(r!.twr).toBeCloseTo(base.twr, 9)
+  })
+})
+
+// ── 緊急備用金（釘住的絕對金額，不參與配置比例）─────────────────────────────
+describe('緊急備用金 emergency_fund', () => {
+  // baseState 的現金：c1 台幣 300,000 + c2 美元 5,000×32 = 160,000 → 合計 460,000
+  const withFund = (target: number, ids: string[] = ['c1']): AppState => ({
+    ...baseState(),
+    emergency_fund: { target_twd: target, account_ids: ids },
+  })
+
+  it('未設定時，所有計算與停用前完全相同', () => {
+    const off = baseState()
+    const zero = withFund(0)
+    expect(emergencyFundTwd(off)).toBe(0)
+    expect(investableTotalTwd(off)).toBe(totalAssetsTwd(off))
+    expect(rebalanceRows(zero)).toEqual(rebalanceRows(off))
+    expect(categorySummaries(zero)).toEqual(categorySummaries(off))
+    expect(defensiveBucketValueTwd(zero)).toBe(defensiveBucketValueTwd(off))
+  })
+
+  it('總資產不受影響，只有可配置資產被扣掉', () => {
+    const s = withFund(100_000)
+    const total = totalAssetsTwd(s)
+    expect(total).toBe(totalAssetsTwd(baseState()))       // 總資產＝完整淨值，不動
+    expect(emergencyFundTwd(s)).toBe(100_000)
+    expect(investableTotalTwd(s)).toBeCloseTo(total - 100_000, 6)
+  })
+
+  it('現金桶現值同步扣掉（不然桶會虛胖，再平衡會叫你賣防禦資產）', () => {
+    const off = baseState()
+    const s = withFund(100_000)
+    expect(defensiveBucketValueTwd(s)).toBeCloseTo(defensiveBucketValueTwd(off) - 100_000, 6)
+  })
+
+  it('各桶 actual_pct 加總仍為 100%（分母是可配置資產）', () => {
+    const s = withFund(100_000)
+    const sum = categorySummaries(s).reduce((a, c) => a + c.actual_pct, 0)
+    expect(sum).toBeCloseTo(100, 6)
+  })
+
+  it('現金桶 drill-down 各項加總等於該桶現值', () => {
+    const s = withFund(100_000)
+    const cashCat = categorySummaries(s).find(c => c.key === 'defensive')!
+    const drill = categoryDrillDown(s, 'defensive' as Category)
+    const drillSum = drill.reduce((a, d) => a + d.value_twd, 0)
+    expect(drillSum).toBeCloseTo(cashCat.value_twd, 6)
+  })
+
+  it('認列帳戶餘額不足時自動縮到實際到位金額，不會算出負數', () => {
+    const s = withFund(999_999_999)                        // 遠超過帳戶餘額
+    expect(emergencyFundTwd(s)).toBe(300_000)              // c1 只有 300,000
+    expect(investableTotalTwd(s)).toBeGreaterThan(0)
+    expect(defensiveBucketValueTwd(s)).toBeGreaterThanOrEqual(0)
+  })
+
+  it('沒指定認列帳戶＝視為 0（不會憑空扣錢）', () => {
+    const s = withFund(100_000, [])
+    expect(emergencyFundTwd(s)).toBe(0)
+    expect(investableTotalTwd(s)).toBe(totalAssetsTwd(s))
+  })
+
+  it('指定多個帳戶時合併計算上限', () => {
+    const s = withFund(400_000, ['c1', 'c2'])
+    expect(emergencyFundSourceTwd(s)).toBeCloseTo(300_000 + 5000 * 32, 6)
+    expect(emergencyFundTwd(s)).toBe(400_000)
+  })
+
+  it('再平衡目標金額以可配置資產為基準（同一 target_pct 會算出較小的目標值）', () => {
+    const off = baseState()
+    const s = withFund(100_000)
+    const rowOff = rebalanceRows(off).find(r => r.symbol === '0050')!
+    const rowOn  = rebalanceRows(s).find(r => r.symbol === '0050')!
+    expect(rowOn.target_pct).toBe(rowOff.target_pct)       // 目標% 不變
+    expect(rowOn.target_value_twd).toBeCloseTo(rowOff.target_value_twd - 100_000 * 0.20, 6)
+  })
+
+  it('新資金分配不會把備用金當成可分配的錢', () => {
+    const s = withFund(100_000)
+    const r = computeNewMoneyAllocation(s, 500_000)
+    expect(r.new_total_twd).toBeCloseTo(investableTotalTwd(s) + 500_000, 6)
+    const spent = r.rows.reduce((a, row) => a + row.buy_amount_twd, 0)
+    expect(spent).toBeLessThanOrEqual(500_000 + 1e-6)
+  })
+
+  it('備用金不影響防禦桶提領的上限計算一致性', () => {
+    const s = withFund(100_000)
+    const avail = defensiveBucketValueTwd(s)
+    const r = computeNewMoneyAllocation(s, 0, avail)
+    const defRow = r.rows.find(row => row.is_defensive)!
+    expect(defRow.current_value_twd).toBeCloseTo(0, 6)     // 全部提光，不會變負的
   })
 })

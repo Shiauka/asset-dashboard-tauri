@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
-import { Plus, RefreshCw, Settings, Eye, EyeOff, Download, Upload, RotateCcw, Trash2, FolderOpen, Pencil, AlertTriangle, PlayCircle, Layers } from 'lucide-react'
+import { Plus, RefreshCw, Settings, Eye, EyeOff, Download, Upload, RotateCcw, Trash2, FolderOpen, Pencil, AlertTriangle, PlayCircle, Layers, ShieldCheck } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +11,7 @@ import {
 import { invoke } from '@tauri-apps/api/core'
 import { loadState, saveState, resetState, clearState, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
 import { getTaiwanToday } from '@/lib/dateUtils'
-import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct, getCategories } from '@/lib/calc'
+import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct, getCategories, emergencyFundTwd, investableTotalTwd } from '@/lib/calc'
 import { INITIAL_STATE } from '@/lib/initialData'
 import { DEMO_STATE } from '@/lib/demoData'
 import type { AppState, Transaction, TxType, Category, RetirementSettings } from '@/lib/types'
@@ -27,6 +27,7 @@ import RetirementProgressPanel from './RetirementProgressPanel'
 import RebalanceAssistant from './RebalanceAssistant'
 import ChannelInfoDialog from './ChannelInfoDialog'
 import CategorySettingsDialog from './CategorySettingsDialog'
+import EmergencyFundDialog from './EmergencyFundDialog'
 
 const fmt = (n: number, digits = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n)
@@ -45,6 +46,7 @@ export default function Dashboard() {
   const [dbOpen, setDbOpen] = useState(false)
   const [channelOpen, setChannelOpen] = useState(false)
   const [categoryOpen, setCategoryOpen] = useState(false)
+  const [emergencyOpen, setEmergencyOpen] = useState(false)
   const [dbRootDir, setDbRootDir] = useState<string | null>(null)
   const [rebalanceCcy, setRebalanceCcy] = useState<'all' | 'TWD' | 'USD'>('all')
   const importRef = useRef<HTMLInputElement>(null)
@@ -324,6 +326,10 @@ export default function Dashboard() {
     if (!state) return null
     const devThreshold = state.retirement.rebalance_threshold_pct ?? 5
     const total = totalAssetsTwd(state)
+    // 緊急備用金是釘住的絕對金額，不參與配置比例；investable 才是各項比例的分母
+    const reserve = emergencyFundTwd(state)
+    const investable = investableTotalTwd(state)
+    const reserveTarget = state.emergency_fund?.target_twd ?? 0
     const byCurrency = assetsByCurrency(state)
     const cats = categorySummaries(state)
     // 總覽只顯示「有市值或有設目標」的桶；純空桶（剛新增、還沒放東西）不顯示，與持倉桶視圖一致。
@@ -333,6 +339,10 @@ export default function Dashboard() {
     const yearsLeft = target_year - new Date().getFullYear()
     return {
       total,
+      reserve,
+      investable,
+      reserveTarget,
+      reserveShortfall: Math.max(0, reserveTarget - reserve),
       totalUsd: total / state.exchange_rate,
       byCurrency,
       cats,
@@ -370,6 +380,7 @@ export default function Dashboard() {
   const {
     total, totalUsd, byCurrency, cats, visibleCats, rebalance, deviatingBuckets, devThreshold,
     target_year, progress, remaining, yearsLeft, reqReturn, barData,
+    reserve, investable, reserveTarget, reserveShortfall,
   } = derived!
   const { retirement_age, target_amount_twd } = state.retirement
   const drillCatMeta = drillCat ? cats.find(c => c.key === drillCat) ?? null : null
@@ -401,6 +412,11 @@ export default function Dashboard() {
           </Button>
           <Button size="sm" variant="outline" onClick={() => setCategoryOpen(true)} title="資產桶設定（新增／刪除／改名／排序）">
             <Layers size={14} className="mr-1" />資產桶設定
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setEmergencyOpen(true)}
+            title="緊急備用金（釘住的金額，不參與配置比例）"
+            className={reserveTarget > 0 ? (reserveShortfall > 0 ? 'text-amber-600 border-amber-400' : 'text-emerald-600 border-emerald-400') : ''}>
+            <ShieldCheck size={14} className="mr-1" />緊急備用金
           </Button>
           <Button size="sm" variant="outline" onClick={() => setDbOpen(true)}
             title={dbRootDir ? `根目錄：${dbRootDir}` : '根目錄設定（未設定）'}
@@ -492,6 +508,20 @@ export default function Dashboard() {
             <p className="text-xs text-muted-foreground mt-1">
               <A>台幣資產 {fmtWan(byCurrency.twd)} · 美元資產 ${fmt(byCurrency.usd)}</A>
             </p>
+            {reserveTarget > 0 && (
+              <p className="text-xs mt-1 flex items-center gap-1">
+                <ShieldCheck size={12} className={reserveShortfall > 0 ? 'text-amber-500' : 'text-emerald-600'} />
+                <span className="text-muted-foreground">
+                  其中緊急備用金 <A>{fmtWan(reserve)}</A>（不參與配置）
+                  {reserveShortfall > 0 && <span className="text-amber-600">・缺口 <A>{fmtWan(reserveShortfall)}</A></span>}
+                </span>
+              </p>
+            )}
+            {reserveTarget > 0 && (
+              <p className="text-xs text-muted-foreground mt-0.5">
+                可配置資產 <A>{fmtWan(investable)}</A>
+              </p>
+            )}
           </CardContent>
         </Card>
         <Card>
@@ -588,7 +618,7 @@ export default function Dashboard() {
                         <div className="text-right">
                           <A><span className="font-medium">{fmtWan(item.value_twd)}</span></A>
                           <span className="text-xs text-muted-foreground ml-1">
-                            ({total > 0 ? ((item.value_twd / total) * 100).toFixed(1) : 0}%)
+                            ({investable > 0 ? ((item.value_twd / investable) * 100).toFixed(1) : 0}%)
                           </span>
                         </div>
                       </div>
@@ -734,7 +764,11 @@ export default function Dashboard() {
                   <div className="flex items-center justify-between flex-wrap gap-2">
                     <div>
                       <CardTitle className="text-base">再平衡缺口分析</CardTitle>
-                      <p className="text-sm text-muted-foreground mt-0.5">以目前總資產 <A>{fmtWan(total)}</A> 為基準計算</p>
+                      <p className="text-sm text-muted-foreground mt-0.5">
+                        {reserveTarget > 0
+                          ? <>以可配置資產 <A>{fmtWan(investable)}</A> 為基準計算（總資產 <A>{fmtWan(total)}</A> 已扣除緊急備用金 <A>{fmtWan(reserve)}</A>）</>
+                          : <>以目前總資產 <A>{fmtWan(total)}</A> 為基準計算</>}
+                      </p>
                     </div>
                     <div className="flex gap-1">
                       {(['all', 'TWD', 'USD'] as const).map(v => (
@@ -784,7 +818,7 @@ export default function Dashboard() {
                       <tbody>
                         {rebalanceFiltered.map(r => {
                           const isPos = r.delta_twd >= 0
-                          const actualPct = total > 0 ? (r.current_value_twd / total) * 100 : 0
+                          const actualPct = investable > 0 ? (r.current_value_twd / investable) * 100 : 0
                           const offsetPct = actualPct - r.target_pct
                           const offsetLabel = r.target_pct > 0
                             ? `${offsetPct >= 0 ? '+' : ''}${offsetPct.toFixed(1)}%`
@@ -940,6 +974,12 @@ export default function Dashboard() {
       </Tabs>
 
       <ChannelInfoDialog open={channelOpen} onClose={() => setChannelOpen(false)} />
+      <EmergencyFundDialog
+        open={emergencyOpen}
+        onClose={() => setEmergencyOpen(false)}
+        state={state}
+        onSave={ef => commit({ ...state, emergency_fund: ef })}
+      />
       <CategorySettingsDialog
         open={categoryOpen}
         onClose={() => setCategoryOpen(false)}

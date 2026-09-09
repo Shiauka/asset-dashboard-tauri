@@ -73,6 +73,15 @@ export interface DailySnapshot {
   exchange_rate?: number                          // USD/TWD rate recorded at snapshot time (Feature 7)
 }
 
+// 緊急備用金：一筆「釘住的絕對金額」，完全不參與配置比例計算。
+// 這筆錢實際躺在 account_ids 指定的現金帳戶裡，所以計算時要同時
+// 從「可配置總額」與「現金桶現值」扣掉——只縮分母不扣桶，現金桶會虛胖，
+// 再平衡反而會叫你賣掉防禦資產。總資產（totalAssetsTwd）維持完整金額不受影響。
+export interface EmergencyFund {
+  target_twd: number      // 想備的金額，例如 1000000
+  account_ids: string[]   // 認列帳戶（CashAccount.id）；空陣列＝尚未指定，視為 0
+}
+
 export interface AppState {
   exchange_rate: number
   holdings: Holding[]
@@ -82,6 +91,8 @@ export interface AppState {
   snapshots: DailySnapshot[]
   // 分類定義。可選：舊存檔／demo／測試未帶此欄時，一律 fallback 到 DEFAULT_CATEGORIES。
   categories?: CategoryDef[]
+  // 緊急備用金。可選：未設定 = 不啟用，所有計算與加入此功能前完全相同。
+  emergency_fund?: EmergencyFund
 }
 
 export interface CategorySummary {

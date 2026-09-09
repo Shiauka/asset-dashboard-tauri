@@ -57,6 +57,19 @@ export function loadState(): AppState {
       target_pct: c.target_pct ?? 0,
     })),
     categories,
+    // 緊急備用金：舊存檔沒有這個欄位就「完全不生出來」，讓存檔往返保持原樣，
+    // 下游三個函式本來就吃 undefined（一律回 0＝停用）。有帶才做清理：
+    // 認列帳戶只保留仍存在的 id，避免刪掉帳戶後留下指向空氣的設定。
+    ...(parsed.emergency_fund
+      ? {
+          emergency_fund: {
+            target_twd: Math.max(0, parsed.emergency_fund.target_twd ?? 0),
+            account_ids: (parsed.emergency_fund.account_ids ?? []).filter(id =>
+              (parsed.cash_accounts ?? []).some(c => c.id === id),
+            ),
+          },
+        }
+      : {}),
   }
 }
 

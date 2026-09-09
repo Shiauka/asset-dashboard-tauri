@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import type { AppState } from '@/lib/types'
-import { computeNewMoneyAllocation, totalAssetsTwd, defensiveBucketValueTwd } from '@/lib/calc'
+import { computeNewMoneyAllocation, totalAssetsTwd, defensiveBucketValueTwd, investableTotalTwd, emergencyFundTwd } from '@/lib/calc'
 
 const fmt = (n: number, d = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n)
@@ -68,7 +68,11 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
     setDrawStr('')
   }
 
+  // 這個助手的所有數字（new_total_twd、投入後比例）都以「可配置資產」為基準，
+  // 提示行也要用同一把尺，不然使用者會拿它去對不上下面的表。
   const total = totalAssetsTwd(state)
+  const investable = investableTotalTwd(state)
+  const reserve = emergencyFundTwd(state)
 
   return (
     <Card>
@@ -284,7 +288,9 @@ export default function RebalanceAssistant({ state, blurred, onThresholdChange }
         {/* Empty state hint */}
         {!submitted && (
           <p className="text-xs text-muted-foreground pt-1">
-            目前總資產 <B>{fmt(total / 10000, 1)} 萬 TWD</B>｜輸入金額後按「計算分配」
+            {reserve > 0
+              ? <>目前可配置資產 <B>{fmt(investable / 10000, 1)} 萬 TWD</B>（總資產 <B>{fmt(total / 10000, 1)} 萬</B> 已扣除緊急備用金 <B>{fmt(reserve / 10000, 1)} 萬</B>）</>
+              : <>目前總資產 <B>{fmt(total / 10000, 1)} 萬 TWD</B></>}｜輸入金額後按「計算分配」
           </p>
         )}
       </CardContent>

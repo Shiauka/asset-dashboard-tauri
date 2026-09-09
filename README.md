@@ -10,7 +10,7 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.6.0 | [asset-dashboard_0.6.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.6.0/asset-dashboard_0.6.0_x64-setup.exe) |
+| Windows 10 / 11 | v0.7.0 | [asset-dashboard_0.7.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.7.0/asset-dashboard_0.7.0_x64-setup.exe) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
@@ -37,6 +37,7 @@
 - 資料以每日 JSON 快照格式存放在自訂根目錄
 - **稅務紀錄**：績效分析頁顯示已實現損益與股息收入，按年度匯整，附賣出明細（均攤成本、賣出價、損益金額）
 - **TWR 歷史匯率修正**：每次存快照時記錄當時 USD/TWD 匯率，TWR 計算以存入當下的匯率換算 USD 現金流；升級前的舊快照無歷史匯率記錄，自動以當前匯率近似
+- **緊急備用金**：指定一筆固定金額（例如 100 萬）與它實際存放的現金帳戶，這筆錢不參與配置比例計算——其他資產的目標 % 加總仍是 100%，不必因為備用金而每次重算比例。比例的分母改用「可配置資產」（總資產 − 已到位的備用金），現金桶現值同步扣除；總資產卡片仍顯示完整淨值，績效與退休進度不受影響。認列帳戶餘額不足時自動縮到實際金額並顯示缺口
 
 ---
 
