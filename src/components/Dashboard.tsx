@@ -9,7 +9,7 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ReferenceLine,
 } from 'recharts'
 import { invoke } from '@tauri-apps/api/core'
-import { loadState, saveState, resetState, clearState, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
+import { loadState, saveState, resetState, clearState, isFirstRun, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
 import { getTaiwanToday } from '@/lib/dateUtils'
 import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct, getCategories, emergencyFundTwd, investableTotalTwd } from '@/lib/calc'
 import { INITIAL_STATE } from '@/lib/initialData'
@@ -33,6 +33,27 @@ const fmt = (n: number, digits = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(n)
 const fmtWan = (twd: number) => `${fmt(twd / 10000, 1)} 萬`
 
+type RetroOp = { tx: Transaction; direction: 1 | -1 }
+
+// YYYY-MM-DD 且是真的日期（擋掉「202608-12-30」這類輸入）
+const isValidDate = (d: string | undefined) => {
+  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return false
+  const t = new Date(`${d}T00:00:00Z`)
+  return !Number.isNaN(t.getTime()) && t.toISOString().slice(0, 10) === d
+}
+
+const EMPTY_FOLDER_NOTICE = '這個資料夾還沒有資料，目前畫面上的資料不會自動寫入。'
+
+
+// 從資料夾讀回來的 state：補齊欄位；資料夾裡的資料永遠不是示範資料
+const toAppState = (s: AppState): AppState => ({
+  ...INITIAL_STATE,
+  ...s,
+  is_sample: false,
+  snapshots: s.snapshots ?? [],
+  cash_accounts: (s.cash_accounts ?? []).map(c => ({ ...c, target_pct: c.target_pct ?? 0 })),
+})
+
 export default function Dashboard() {
   const [state, setState] = useState<AppState | null>(null)
   const [txOpen, setTxOpen] = useState(false)
@@ -48,27 +69,214 @@ export default function Dashboard() {
   const [categoryOpen, setCategoryOpen] = useState(false)
   const [emergencyOpen, setEmergencyOpen] = useState(false)
   const [dbRootDir, setDbRootDir] = useState<string | null>(null)
-  // 資料檔損毀／存檔失敗的警告。以前這些錯誤都被 .catch(() => {}) 吞掉，
-  // 9 月快照整月歸零時畫面完全沒提示，還拿 8/31 的舊狀態繼續跑（2026-09-30）。
-  const [dataAlert, setDataAlert] = useState<string | null>(null)
-  // 有月份檔損毀且無備份時停止自動存檔：此時記憶體裡是較早月份的舊狀態，
-  // 存下去會把錯的資料寫成那個月的新檔案。
-  const saveBlockedRef = useRef(false)
+  const rootDirRef = useRef<string | null>(null)
+  // ── 資料保護（2026-09-30 資料流失事件後重寫）──────────────────────────────
+  // writeBlock：資料夾有問題（壞檔、找不到、被其他視窗改過…）的原因。非 null 時：
+  //   所有會改資料的操作都直接擋下並說明（不再「畫面看起來存了其實沒存」），紅色橫幅不能關。
+  // notices：一般提醒，可關閉。
+  // revRef：讀到的資料版本；每次存檔帶上，資料夾被別人改過就拒絕，不會互相覆蓋。
+  // diskQueue：所有讀寫依序執行，避免兩次存檔拿到同一個版本號。
+  const [writeBlock, setWriteBlock] = useState<string | null>(null)
+  const writeBlockRef = useRef<string | null>(null)
+  const [notices, setNotices] = useState<string[]>([])
+  const revRef = useRef<string | null>(null)
+  const diskQueue = useRef<Promise<unknown>>(Promise.resolve())
+  const dirtyRef = useRef(false)
+  const saveTimer = useRef<number | null>(null)
+  // 連到一個還沒有資料的資料夾：要使用者按「儲存」確認後才寫入（不能自動把畫面資料灌進去）
+  const emptyFolderRef = useRef(false)
+  const [busy, setBusyState] = useState(false)
+  const busyRef = useRef(false)
+  const setBusy = (b: boolean) => { busyRef.current = b; setBusyState(b) }
+  const [dailyBackups, setDailyBackups] = useState<string[]>([])
+  const [restoreDate, setRestoreDate] = useState<string>('')
+  const scheduleSaveRef = useRef<(() => void) | null>(null)
   const [rebalanceCcy, setRebalanceCcy] = useState<'all' | 'TWD' | 'USD'>('all')
   const importRef = useRef<HTMLInputElement>(null)
   const resetMenuRef = useRef<HTMLDivElement>(null)
   const [showResetMenu, setShowResetMenu] = useState(false)
 
+  const stateRef = useRef<AppState | null>(null)
   const commit = useCallback((next: AppState) => {
+    stateRef.current = next
     setState(next)
     saveState(next)
   }, [])
 
-  const handleRootDirChange = useCallback((dir: string | null) => {
+  const block = useCallback((reason: string | null) => {
+    writeBlockRef.current = reason
+    setWriteBlock(reason)
+  }, [])
+  const notify = useCallback((msg: string) => setNotices(n => (n.includes(msg) ? n : [...n, msg])), [])
+  const blockedAlert = () => alert(`目前無法儲存，這個操作沒有執行：\n\n${writeBlockRef.current}`)
+
+  const enqueue = useCallback(<T,>(job: () => Promise<T>): Promise<T> => {
+    const p = diskQueue.current.then(job, job)
+    diskQueue.current = p.catch(() => {})
+    return p
+  }, [])
+
+  const handleDiskError = useCallback((e: unknown) => {
+    const msg = String(e)
+    if (msg.startsWith('CONFLICT'))
+      block('資料夾裡的資料已被其他視窗或程式修改過，為避免互相覆蓋已停止儲存。請按工具列的「從根目錄載入」取得最新資料（這個視窗裡尚未儲存的變更會被捨棄）。')
+    else if (msg.includes('為保護資料已停止寫入') || msg.includes('找不到資料夾'))
+      block(msg)
+    else
+      notify(`儲存失敗：${msg}`)
+  }, [block, notify])
+
+  type LoadBody = {
+    ok?: boolean; code?: string; error?: string; state?: AppState; date?: string
+    brokenFiles?: string[]; recoveredFiles?: string[]; warnings?: string[]
+    cashMismatches?: { bank: string; dashboard: number; ledger: number }[]
+    writeBlocked?: boolean; rev?: string; hasDailyBackup?: boolean; dailyBackups?: string[]
+  }
+
+  // 讀根目錄：設定寫入保護、提醒、版本；回傳載入的 state（沒有可用資料時為 null）
+  const loadFromDisk = useCallback(async (): Promise<{ loaded: AppState | null; body: LoadBody }> => {
+    const body = await enqueue(() => invoke<LoadBody>('load_snapshots'))
+    revRef.current = body.rev ?? null
+    emptyFolderRef.current = body.code === 'EMPTY'
+    setDailyBackups(body.dailyBackups ?? [])
+    setRestoreDate((body.dailyBackups ?? []).slice(-1)[0] ?? '')
+    if (body.brokenFiles?.length)
+      block(`以下資料檔損毀或讀不到，為保護資料已停止所有儲存：${body.brokenFiles.join('、')}。\n處理方式：先確認檔案沒有被其他程式（雲端硬碟同步、防毒）佔用後按「重新載入」；若檔案真的壞了，${body.hasDailyBackup
+        ? '按下方「從每日備份還原」（交易與快照會整組回到那一天，現在的檔案會先保留在 backup\\corrupt\\）'
+        : '請從你自己的備份（例如雲端硬碟的「版本記錄」、外接硬碟）把整個資料夾還原到同一個時間點——交易檔與快照檔要是同一時間的，只換其中一個會讓資料對不上（這個資料夾還沒有自動備份）'}。`)
+    else if (body.writeBlocked)
+      block(body.error ?? '資料夾目前無法使用，已停止儲存。')
+    else
+      block(null)
+    const msgs: string[] = []
+    if (body.recoveredFiles?.length)
+      msgs.push(`以下快照檔損毀，已自動用備份修復（損毀的原檔保存在 backup\\corrupt\\）：${body.recoveredFiles.join('、')}。備份可能少了最後一次存檔的內容，最近幾天的餘額或股數可能不對。${(body.dailyBackups ?? []).length
+        ? '如果數字不對，可以用紅色橫幅或根目錄設定的「從每日備份還原」，把交易與快照整組回到那一天。' : ''}`)
+    if (body.code === 'EMPTY')
+      msgs.push(`${EMPTY_FOLDER_NOTICE}要把目前畫面上的資料存進去，請按工具列的「存至根目錄」（下載圖示）；選錯資料夾的話到根目錄設定換回來即可。`)
+    for (const w of body.warnings ?? []) msgs.push(w)
+    if (body.cashMismatches?.length)
+      msgs.push(`現金餘額與帳務管家的帳目不一致：${body.cashMismatches.map(m => `${m.bank}（看板 ${m.dashboard.toLocaleString()}／帳目 ${m.ledger.toLocaleString()}）`).join('；')}。請核對兩邊的紀錄。`)
+    setNotices(msgs)
+    dirtyRef.current = false
+    return { loaded: body.ok && body.state ? toAppState(body.state) : null, body }
+  }, [enqueue, block])
+
+  type SaveResult = { ok: boolean; rev?: string; warnings?: string[]; changed?: boolean; state?: AppState; snapshots?: AppState['snapshots'] }
+  type Change = (s: AppState) => { next: AppState; retro: RetroOp[] }
+
+  // 寫進資料夾（只在這裡呼叫 save_snapshot）：
+  // - 在佇列裡「輪到時」才取最新的畫面狀態、再套用這次的變更（不會拿點擊當下的舊狀態蓋掉前一次存的結果）
+  // - 後端在同一筆寫入裡做：帳務管家同步、過去日期的歷史回填、今天的快照、交易清單
+  // - 沒有根目錄 / 示範資料 / 還沒確認要存進的新資料夾 → 只存本機
+  // 回傳存下的 state；失敗回 null（原因已顯示）。
+  const persist = useCallback((change: Change | null, background = false): Promise<AppState | null> => enqueue(async () => {
+    const base = stateRef.current
+    if (!base) return null
+    const { next, retro } = change ? change(base) : { next: base, retro: [] as RetroOp[] }
+    if (!rootDirRef.current || next.is_sample || emptyFolderRef.current) {
+      if (change) commit(next)
+      dirtyRef.current = false
+      return next
+    }
+    if (writeBlockRef.current) {
+      // 無法寫入時，背景更新（報價）至少讓畫面看得到；使用者操作則照常擋下
+      if (background && change && stateRef.current === base) commit(next)
+      return null
+    }
+    try {
+      const r = await invoke<SaveResult>('save_snapshot', { state: next, expectedRev: revRef.current, retro })
+      if (r.rev) revRef.current = r.rev
+      r.warnings?.forEach(notify)
+      let saved = r.state ? toAppState(r.state) : next
+      if (r.snapshots) saved = { ...saved, snapshots: r.snapshots }
+      // 使用者操作：存下的就是畫面（操作期間畫面鎖住，不會有別的變更）。
+      // 背景存檔：存檔期間畫面若被改過，就不覆蓋（那次修改會自己再存一次）。
+      if (stateRef.current === base || (change && !background)) {
+        commit(saved)
+        dirtyRef.current = false
+      } else if (change && background) {
+        // 背景更新（報價）存檔期間畫面被編輯過：把同樣的變更套到現在的畫面上，稍後一起存，不蓋掉編輯
+        commit(change(stateRef.current!).next)
+        dirtyRef.current = true
+        scheduleSaveRef.current?.()
+      }
+      return saved
+    } catch (e) {
+      handleDiskError(e)
+      return null
+    }
+  }), [enqueue, commit, notify, handleDiskError])
+
+  // 背景存檔（切回視窗、編輯後、報價更新後）
+  const backgroundSave = useCallback(async () => { await persist(null) }, [persist])
+
+  const scheduleSave = useCallback(() => {
+    if (saveTimer.current) clearTimeout(saveTimer.current)
+    saveTimer.current = window.setTimeout(() => { saveTimer.current = null; void backgroundSave() }, 800)
+  }, [backgroundSave])
+  scheduleSaveRef.current = scheduleSave
+
+  const storesToFolder = () => !!rootDirRef.current && !stateRef.current?.is_sample && !emptyFolderRef.current
+
+  // 一般編輯（持倉表、目標比例、分類、備用金、退休設定、報價…）：套用後自動存檔
+  const editState = useCallback((next: AppState) => {
+    if (busyRef.current) return // 交易存檔中（畫面鎖住），不接受其他修改
+    if (rootDirRef.current && writeBlockRef.current) { blockedAlert(); return }
+    commit(next)
+    if (storesToFolder()) dirtyRef.current = true
+    scheduleSave()
+  }, [commit, scheduleSave])
+
+  // 會動到交易的操作：鎖住畫面 → 存成功才更新畫面；存不進去就不改畫面並說明
+  const commitAfterSave = useCallback(async (change: Change) => {
+    if (rootDirRef.current && writeBlockRef.current) { blockedAlert(); return }
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
+    setBusy(true)
+    try {
+      const saved = await persist(change)
+      if (!saved) alert(`這筆變更沒有儲存：\n\n${writeBlockRef.current ?? '請看畫面上方的訊息。'}`)
+    } finally {
+      setBusy(false)
+    }
+  }, [persist])
+
+  const refreshPrices = useCallback((base: AppState) => {
+    invoke<{ prices: Record<string, number | null>; exchange_rate: number | null }>('fetch_prices', {
+      holdings: base.holdings.map(h => ({ symbol: h.symbol, currency: h.currency })),
+    }).then(pricesData => {
+      // 排進佇列：等進行中的存檔完成後，套在「那時」最新的 state 上，再存檔
+      void persist(cur => {
+        let next = cur
+        if (pricesData.exchange_rate !== null && pricesData.exchange_rate > 0)
+          next = updateExchangeRate(next, pricesData.exchange_rate)
+        for (const [sym, price] of Object.entries(pricesData.prices))
+          if (price !== null && price > 0) next = updateHoldingPrice(next, sym, price)
+        return { next: addSnapshot(next, totalAssetsTwd(next)), retro: [] }
+      }, true)
+    }).catch(() => {})
+  }, [commit, backgroundSave])
+
+  // 換根目錄：一律重新從新資料夾載入，不能把舊資料夾的畫面狀態寫進新資料夾
+  const handleRootDirChange = useCallback(async (dir: string | null) => {
+    if (dir === rootDirRef.current) return
+    // 舊資料夾排隊中的存檔先做完（寫進舊資料夾），再切換
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null; await backgroundSave() }
+    await diskQueue.current
     setDbRootDir(dir)
+    rootDirRef.current = dir
+    revRef.current = null
+    emptyFolderRef.current = false
     if (dir) localStorage.setItem('asset_dashboard_rootDir', dir)
     else localStorage.removeItem('asset_dashboard_rootDir')
-  }, [])
+    if (!dir) { block(null); setNotices([]); return }
+    try {
+      const { loaded } = await loadFromDisk()
+      if (loaded) commit(addSnapshot(loaded, totalAssetsTwd(loaded)))
+    } catch (e) {
+      block(`無法讀取資料夾：${String(e)}`)
+    }
+  }, [loadFromDisk, block, commit, backgroundSave])
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -78,6 +286,7 @@ export default function Dashboard() {
 
     async function init() {
       if (isDemo) {
+        stateRef.current = DEMO_STATE
         setState(DEMO_STATE)
         return
       }
@@ -92,140 +301,129 @@ export default function Dashboard() {
         const cached = localStorage.getItem('asset_dashboard_rootDir')
         if (cached) {
           rootDir = cached
-          invoke('set_db_config', { rootDir }).catch(() => {})
+          try { await invoke('set_db_config', { rootDir }) } catch {}
         }
       } else {
         localStorage.setItem('asset_dashboard_rootDir', rootDir)
       }
 
       setDbRootDir(rootDir)
+      rootDirRef.current = rootDir
 
       if (rootDir) {
         try {
-          const body = await invoke<{ ok?: boolean; state?: AppState; date?: string; brokenFiles?: string[]; recoveredFiles?: string[]; cashMismatches?: { bank: string; dashboard: number; ledger: number }[]; backupError?: string | null }>('load_snapshots')
-          if (body.brokenFiles?.length) {
-            saveBlockedRef.current = true
-            setDataAlert(`快照檔損毀且沒有備份：${body.brokenFiles.join('、')}。目前顯示的是 ${body.date ?? '較早'} 的資料，已暫停自動存檔以免寫入錯誤資料。請不要刪除損毀的檔案，先找 Claude 修復。`)
-          } else if (body.cashMismatches?.length) {
-            setDataAlert(`現金餘額跟帳務管家帳目對不上：${body.cashMismatches.map(m => `${m.bank} 看板 ${m.dashboard.toLocaleString()}／帳務管家 ${m.ledger.toLocaleString()}`).join('；')}。以帳務管家為準，請找 Claude 對帳。`)
-          } else if (body.backupError) {
-            setDataAlert(`今日自動備份失敗：${body.backupError}`)
-          } else if (body.recoveredFiles?.length) {
-            setDataAlert(`快照檔 ${body.recoveredFiles.join('、')} 損毀，已自動改用備份讀取（最多少了最後一次存檔），下次存檔會自動修復。`)
-          }
-          if (body.ok && body.state) {
-            const merged: AppState = {
-              ...INITIAL_STATE,
-              ...body.state,
-              snapshots: body.state.snapshots ?? [],
-              cash_accounts: (body.state.cash_accounts ?? []).map(c => ({ ...c, target_pct: c.target_pct ?? 0 })),
-            }
-
-            // 立刻用當下 cash_accounts（已含 budget sync）重建今日快照，
-            // 避免舊快照 + 新 cash_out 交易造成 TWR 假性暴增
-            const mergedWithSnap = addSnapshot(merged, totalAssetsTwd(merged))
-            commit(mergedWithSnap)
-
-            // 股價 + 匯率在背景更新，完成後再刷新
-            invoke<{ prices: Record<string, number | null>; exchange_rate: number | null }>('fetch_prices', {
-              holdings: merged.holdings.map(h => ({ symbol: h.symbol, currency: h.currency })),
-            }).then(pricesData => {
-              let next = mergedWithSnap
-              if (pricesData.exchange_rate !== null && pricesData.exchange_rate > 0)
-                next = updateExchangeRate(next, pricesData.exchange_rate)
-              for (const [sym, price] of Object.entries(pricesData.prices))
-                if (price !== null && price > 0) next = updateHoldingPrice(next, sym, price)
-              next = addSnapshot(next, totalAssetsTwd(next))
-              commit(next)
-              if (rootDir && !saveBlockedRef.current)
-                invoke('save_snapshot', { state: next }).catch(e => setDataAlert(`自動存檔失敗：${String(e)}`))
-            }).catch(() => {})
-
+          const { loaded } = await loadFromDisk()
+          if (loaded) {
+            const withSnap = addSnapshot(loaded, totalAssetsTwd(loaded))
+            commit(withSnap)
+            refreshPrices(withSnap)
             return
           }
-        } catch {}
+          // EMPTY（新資料夾）→ 沿用本機資料、等使用者按儲存；其他狀況已經設了寫入保護與說明
+        } catch (e) {
+          block(`無法讀取資料夾：${String(e)}`)
+        }
       }
 
-      setState(loadState())
+      const local = isFirstRun() ? { ...loadState(), is_sample: true } : loadState()
+      stateRef.current = local
+      setState(local)
+      // 示範資料已經有自己的說明橫幅，不再同時顯示「空資料夾要按存至根目錄」（兩條說法互相矛盾）
+      if (local.is_sample) setNotices(ns => ns.filter(n => !n.startsWith(EMPTY_FOLDER_NOTICE)))
+      if (rootDir) refreshPrices(local)
     }
     init()
-  }, [commit])
+  }, [commit, loadFromDisk, refreshPrices, block])
 
-  // 存檔前先跟帳務管家最新資料重新比對一次（refresh_budget_sync），有變更就先
-  // commit 合併後的 state 再存檔 —— 避免看板開著沒重啟時，用記憶體裡的舊
-  // cash_accounts 把帳務管家同一時間新增的異動蓋掉。
-  const saveToDb = useCallback(async (next: AppState): Promise<void> => {
-    if (!dbRootDir || saveBlockedRef.current) return
-    let toSave = next
-    try {
-      const body = await invoke<{ changed?: boolean; state?: AppState }>('refresh_budget_sync', { state: next })
-      if (body.changed && body.state) {
-        toSave = body.state
-        commit(toSave)
-      }
-    } catch {}
-    await invoke('save_snapshot', { state: toSave }).catch(e => setDataAlert(`自動存檔失敗：${String(e)}`))
-  }, [dbRootDir, commit])
-
-  // 切回這個視窗時自動重新比對一次帳務管家資料，不用等重開 App 或手動按「匯入」。
-  // saveToDb 內建 refresh_budget_sync 自我修復，沒有變更就只是多寫一次同樣內容。
-  const stateRef = useRef<AppState | null>(null)
-  useEffect(() => { stateRef.current = state }, [state])
+  useEffect(() => {
+    if (!busy) return
+    const stop = (e: Event) => { e.preventDefault(); e.stopPropagation() }
+    window.addEventListener('keydown', stop, true)
+    window.addEventListener('keypress', stop, true)
+    return () => { window.removeEventListener('keydown', stop, true); window.removeEventListener('keypress', stop, true) }
+  }, [busy])
 
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return
-    let unlisten: (() => void) | undefined
+    let unlistenFocus: (() => void) | undefined
+    let unlistenClose: (() => void) | undefined
     let disposed = false
     import('@tauri-apps/api/window').then(({ getCurrentWindow }) => {
       if (disposed) return
-      getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-        if (focused && dbRootDir && stateRef.current) void saveToDb(stateRef.current)
-      }).then(fn => { unlisten = fn })
+      const w = getCurrentWindow()
+      w.onFocusChanged(({ payload: focused }) => {
+        if (focused) onFocus()
+      }).then(fn => { unlistenFocus = fn })
+      // 關閉前把還沒存的編輯存完；存不進去要讓使用者知道再決定
+      w.onCloseRequested(async ev => {
+        ev.preventDefault()
+        if (saveTimer.current) {
+          clearTimeout(saveTimer.current)
+          saveTimer.current = null
+          await backgroundSave()
+        }
+        await diskQueue.current
+        if (storesToFolder() && dirtyRef.current &&
+          !confirm(`有變更還沒存進資料夾：\n\n${writeBlockRef.current ?? '存檔失敗，請看畫面上方的訊息。'}\n\n仍要關閉嗎？（這些變更只保留在本機，下次開啟會被資料夾的資料取代）`))
+          return
+        await w.destroy()
+      }).then(fn => { unlistenClose = fn })
     }).catch(() => {})
-    return () => { disposed = true; unlisten?.() }
-  }, [dbRootDir, saveToDb])
-
-  const reloadDbSnapshots = useCallback(async (base: AppState): Promise<AppState> => {
-    if (!dbRootDir) return base
-    try {
-      const body = await invoke<{ ok?: boolean; state?: AppState }>('load_snapshots')
-      if (body.ok && body.state?.snapshots) {
-        return { ...base, snapshots: body.state.snapshots }
-      }
-    } catch {}
-    return base
-  }, [dbRootDir])
-
-  const retroactiveDbUpdate = useCallback((tx: Transaction, direction: 1 | -1 = 1): Promise<void> => {
-    if (!dbRootDir || tx.date >= getTaiwanToday()) return Promise.resolve()
-    return invoke('retroactive_update', { tx, direction }).then(() => {})
-      .catch(e => setDataAlert(`回填歷史快照失敗：${String(e)}`))
-  }, [dbRootDir])
+    // 兩個視窗互相點選時，Tauri 的焦點事件不一定會來；瀏覽器層的 focus 也一起聽（1.5 秒內只觸發一次）
+    let last = 0
+    function onFocus() {
+      const now = Date.now()
+      if (now - last < 1500) return
+      last = now
+      if (rootDirRef.current && stateRef.current && !writeBlockRef.current) void backgroundSave()
+    }
+    window.addEventListener('focus', onFocus)
+    const onVis = () => { if (document.visibilityState === 'visible') onFocus() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => {
+      disposed = true; unlistenFocus?.(); unlistenClose?.()
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVis)
+    }
+  }, [backgroundSave])
 
   const handleTransaction = useCallback(async (tx: Transaction) => {
-    if (!state) return
-    let next = applyTransaction(state, tx)
-    next = retroactivelyAdjustSnapshots(next, tx)
-    next = addSnapshot(next, totalAssetsTwd(next))
-    commit(next)
-    await saveToDb(next)
-    await retroactiveDbUpdate(tx, 1)
-    if (tx.date < getTaiwanToday()) {
-      const reloaded = await reloadDbSnapshots(next)
-      commit(reloaded)
-    }
-  }, [state, commit, saveToDb, retroactiveDbUpdate, reloadDbSnapshots])
+    if (!isValidDate(tx.date)) { alert(`日期格式不正確：「${tx.date}」。請輸入像 2026-09-30 這樣的日期。`); return }
+    await commitAfterSave(base => {
+      let next = applyTransaction(base, tx)
+      next = retroactivelyAdjustSnapshots(next, tx)
+      next = addSnapshot(next, totalAssetsTwd(next))
+      return { next, retro: tx.date < getTaiwanToday() ? [{ tx, direction: 1 }] : [] }
+    })
+  }, [commitAfterSave])
 
   const handleResetToDefault = () => {
     setShowResetMenu(false)
-    if (!confirm('確定回到預設範例？目前所有資料將被覆蓋。')) return
-    setState(resetState())
+    if (rootDirRef.current) {
+      alert('已連接資料夾時無法回到範例，以免資料夾裡的資料被範例覆蓋。\n如果真的要重來，請先到「根目錄設定」清除資料夾設定。')
+      return
+    }
+    if (!confirm('確定回到預設範例？目前本機的資料將被覆蓋。')) return
+    const s = { ...resetState(), is_sample: true }
+    commit(s)
   }
 
   const handleClearAll = () => {
     setShowResetMenu(false)
-    if (!confirm('確定清空所有資料？此操作無法復原。')) return
-    setState(clearState())
+    if (rootDirRef.current && !state?.is_sample && !emptyFolderRef.current) {
+      alert('已連接資料夾時無法清空，以免資料夾裡的資料被清掉。\n如果真的要重來，請先到「根目錄設定」清除資料夾設定。')
+      return
+    }
+    if (!confirm(emptyFolderRef.current && rootDirRef.current
+      ? `確定清空並開始記錄自己的資料？\n之後的記錄會寫進目前連接的資料夾：\n${rootDirRef.current}`
+      : '確定清空所有資料？此操作無法復原。')) return
+    commit(clearState())
+    // 清空後就是使用者自己的（空白）資料：連到的是還沒有資料的資料夾時，之後的記錄直接寫進去
+    if (emptyFolderRef.current) {
+      emptyFolderRef.current = false
+      setNotices(ns => ns.filter(n => !n.startsWith(EMPTY_FOLDER_NOTICE)))
+      void persist(null)
+    }
   }
 
   useEffect(() => {
@@ -239,43 +437,55 @@ export default function Dashboard() {
   }, [showResetMenu])
 
   const handleDeleteTransaction = useCallback(async (id: string) => {
-    if (!state) return
-    const tx = state.transactions.find(t => t.id === id)
+    const tx = stateRef.current?.transactions.find(t => t.id === id)
     if (!tx) return
+    // 來自帳務管家的交易以帳務管家為準（在這裡刪，下次同步又會回來）
+    if ((tx as Transaction & { budget_tx_id?: string }).budget_tx_id) {
+      alert('這筆是從帳務管家同步過來的交易，請到帳務管家刪除或修改，儀表板會自動跟著更新。')
+      return
+    }
     const typeLabel: Record<string, string> = {
       buy: '買入', sell: '賣出', cash_in: '現金入', cash_out: '現金出',
       new_position: '建立股票', new_cash_account: '建立現金', transfer: '帳戶轉帳',
     }
-    if (!confirm(`確定刪除這筆「${typeLabel[tx.type]}」紀錄並還原其對持倉的影響？`)) return
-    let next = reverseTransaction(state, id)
-    next = retroactivelyAdjustSnapshots(next, tx, -1)
-    next = addSnapshot(next, totalAssetsTwd(next))
-    commit(next)
-    await saveToDb(next)
-    await retroactiveDbUpdate(tx, -1)
-    if (tx.date < getTaiwanToday()) {
-      const reloaded = await reloadDbSnapshots(next)
-      commit(reloaded)
-    }
-  }, [state, commit, saveToDb, retroactiveDbUpdate, reloadDbSnapshots])
+    const detail = [tx.date, tx.symbol, tx.shares ? `${tx.shares} 股` : '', tx.bank,
+      tx.amount ? `金額 ${tx.amount.toLocaleString()}` : ''].filter(Boolean).join('　')
+    if (!confirm(`確定刪除這筆「${typeLabel[tx.type] ?? tx.type}」紀錄並還原其對持倉的影響？
+
+${detail}`)) return
+    await commitAfterSave(base => {
+      const cur = base.transactions.find(t => t.id === id)
+      if (!cur) return { next: base, retro: [] }
+      let next = reverseTransaction(base, id)
+      next = retroactivelyAdjustSnapshots(next, cur, -1)
+      next = addSnapshot(next, totalAssetsTwd(next))
+      return { next, retro: cur.date < getTaiwanToday() ? [{ tx: cur, direction: -1 }] : [] }
+    })
+  }, [commitAfterSave])
 
   const handleEditSubmit = useCallback(async (id: string, updates: Partial<Transaction>) => {
-    if (!state) return
-    const result = editTransaction(state, id, updates)
-    if (!result) return
-    const { next, oldTx, newTx } = result
-    let final = retroactivelyAdjustSnapshots(next, oldTx, -1)
-    final = retroactivelyAdjustSnapshots(final, newTx, 1)
-    final = addSnapshot(final, totalAssetsTwd(final))
-    commit(final)
-    await saveToDb(final)
-    await retroactiveDbUpdate(oldTx, -1)
-    await retroactiveDbUpdate(newTx, 1)
-    if (oldTx.date < getTaiwanToday() || newTx.date < getTaiwanToday()) {
-      const reloaded = await reloadDbSnapshots(final)
-      commit(reloaded)
+    const cur = stateRef.current?.transactions.find(t => t.id === id) as (Transaction & { budget_tx_id?: string }) | undefined
+    if (cur?.budget_tx_id) {
+      alert('這筆是從帳務管家同步過來的交易，請到帳務管家修改，儀表板會自動跟著更新。')
+      return
     }
-  }, [state, commit, saveToDb, retroactiveDbUpdate, reloadDbSnapshots])
+    if (updates.date !== undefined && !isValidDate(updates.date)) {
+      alert(`日期格式不正確：「${updates.date}」。請輸入像 2026-09-30 這樣的日期。`); return
+    }
+    await commitAfterSave(base => {
+      const result = editTransaction(base, id, updates)
+      if (!result) return { next: base, retro: [] }
+      const { next, oldTx, newTx } = result
+      let final = retroactivelyAdjustSnapshots(next, oldTx, -1)
+      final = retroactivelyAdjustSnapshots(final, newTx, 1)
+      final = addSnapshot(final, totalAssetsTwd(final))
+      const today = getTaiwanToday()
+      const retro: RetroOp[] = []
+      if (oldTx.date < today) retro.push({ tx: oldTx, direction: -1 })
+      if (newTx.date < today) retro.push({ tx: newTx, direction: 1 })
+      return { next: final, retro }
+    })
+  }, [commitAfterSave])
 
   const handleTabChange = useCallback((newTab: string) => {
     if (activeTab === 'holdings' && newTab !== 'holdings' && state) {
@@ -293,49 +503,71 @@ export default function Dashboard() {
 
   const handleRetirementSave = (settings: RetirementSettings) => {
     if (!state) return
-    commit(updateRetirement(state, settings))
+    editState(updateRetirement(state, settings))
   }
 
   const handleThresholdChange = (pct: number) => {
     if (!state) return
-    commit(updateRetirement(state, { rebalance_threshold_pct: pct }))
+    editState(updateRetirement(state, { rebalance_threshold_pct: pct }))
   }
 
+  // 手動儲存：也是「確認要把畫面資料存進新資料夾／存成正式資料」的唯一入口
   const handleExport = async () => {
-    if (!state) return
-    if (!dbRootDir) { alert('請先在「根目錄設定」中指定資料庫路徑'); return }
+    const cur = stateRef.current
+    if (!cur) return
+    if (!rootDirRef.current) { alert('請先在「根目錄設定」中指定資料庫路徑'); return }
+    if (writeBlockRef.current) { blockedAlert(); return }
+    if (cur.is_sample && !confirm('目前畫面是示範資料。確定要把它存成你在這個資料夾裡的正式資料嗎？')) return
+    if (emptyFolderRef.current && !cur.is_sample &&
+      !confirm(`要把目前畫面上的資料存進這個資料夾嗎？\n${rootDirRef.current}`)) return
+    emptyFolderRef.current = false
+    setNotices(ns => ns.filter(n => !n.startsWith(EMPTY_FOLDER_NOTICE)))
+    setBusy(true)
     try {
-      const body = await invoke<{ ok?: boolean; date?: string; error?: string }>('save_snapshot', { state })
-      if (body.ok) alert(`已儲存今日資料至 ${body.date}.json`)
-      else alert(body.error ?? '儲存失敗')
-    } catch (e) {
-      alert(String(e))
+      const saved = await persist(s => ({ next: { ...s, is_sample: false }, retro: [] }))
+      if (saved) alert(`已儲存今日資料（${getTaiwanToday()}）`)
+      else alert(`沒有儲存：\n\n${writeBlockRef.current ?? '請看畫面上方的訊息。'}`)
+    } finally {
+      setBusy(false)
     }
   }
 
-  const handleImport = async () => {
-    if (!dbRootDir) { alert('請先在「根目錄設定」中指定資料庫路徑'); return }
-    if (!confirm('確定要從根目錄載入最新資料？目前未儲存的異動將遺失。')) return
+  const reloadFromDisk = async () => {
     try {
-      const body = await invoke<{ ok?: boolean; state?: AppState; date?: string; error?: string }>('load_snapshots')
-      if (!body.ok || !body.state) { alert(body.error ?? '載入失敗'); return }
-      const merged: AppState = {
-        ...INITIAL_STATE,
-        ...body.state,
-        snapshots: body.state.snapshots ?? [],
-        cash_accounts: (body.state.cash_accounts ?? []).map(c => ({ ...c, target_pct: c.target_pct ?? 0 })),
-      }
-      commit(merged)
+      const { loaded, body } = await loadFromDisk()
+      if (!loaded) { alert(body.error ?? '載入失敗'); return }
+      commit(addSnapshot(loaded, totalAssetsTwd(loaded)))
       alert(`已載入 ${body.date} 的資料`)
     } catch (e) {
       alert(String(e))
     }
   }
 
+  const handleRestoreBackup = async () => {
+    const date = restoreDate || dailyBackups[dailyBackups.length - 1]
+    if (!date) return
+    if (!confirm(`要把儀表板的交易與快照整組還原到 ${date} 的每日備份嗎？\n\n` +
+      `· 這份備份是 ${date} 當天第一次開啟儀表板時做的：從那時起在儀表板做的變更（包含 ${date} 當天）都會消失（帳務管家的記帳不受影響，會重新同步過來；帳務管家裡對應的買賣扣款也會自動跟著調整）\n` +
+      `· 現在的檔案（含損毀的）會先保留在 backup\\corrupt\\`)) return
+    try {
+      await enqueue(() => invoke('restore_daily_backup', { date }))
+    } catch (e) {
+      alert(`還原失敗：${String(e)}`)
+      return
+    }
+    await reloadFromDisk()
+  }
+
+  const handleImport = async () => {
+    if (!rootDirRef.current) { alert('請先在「根目錄設定」中指定資料庫路徑'); return }
+    if (!confirm('確定要從根目錄載入最新資料？目前未儲存的異動將遺失。')) return
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = null }
+    await reloadFromDisk()
+  }
+
   const handlePriceUpdate = useCallback((next: AppState) => {
-    commit(next)
-    void saveToDb(next)
-  }, [commit, saveToDb])
+    editState(next)
+  }, [editState])
 
   // All per-state derivations in one memo — recomputed only when `state` changes,
   // not on every unrelated re-render (tab switch, blur toggle, dialog open). Must sit
@@ -405,10 +637,45 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-background p-4 md:p-6 space-y-6">
-      {dataAlert && (
-        <div role="alert" className="flex items-start gap-3 rounded-md border border-red-500 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-300">
-          <span className="flex-1">⚠️ {dataAlert}</span>
-          <button className="shrink-0 underline" onClick={() => setDataAlert(null)}>關閉</button>
+      {busy && <div className="fixed inset-0 z-[100] cursor-wait" aria-busy="true" title="儲存中…" />}
+      {writeBlock && (
+        <div role="alert" className="rounded-md border-2 border-red-600 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-800 dark:text-red-200 whitespace-pre-line">
+          <p className="font-semibold">⛔ 已停止儲存，目前的新增或修改都不會存進資料夾</p>
+          <p className="mt-1">{writeBlock}</p>
+          {dbRootDir && (
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Button size="sm" variant="outline" onClick={() => void reloadFromDisk()}>
+                處理好了，從資料夾重新載入
+              </Button>
+              {dailyBackups.length > 0 && (
+                <span className="flex items-center gap-1">
+                  <select className="h-8 rounded border border-red-400 bg-transparent px-1 text-sm"
+                    value={restoreDate} onChange={e => setRestoreDate(e.target.value)} aria-label="選擇要還原的備份日期">
+                    {[...dailyBackups].reverse().map(d => <option key={d} value={d}>{d}</option>)}
+                  </select>
+                  <Button size="sm" variant="outline" onClick={() => void handleRestoreBackup()}>
+                    從這天的每日備份還原
+                  </Button>
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+      {notices.map((n, i) => (
+        <div key={i} role="status" className="flex items-start gap-3 rounded-md border border-amber-500 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+          <span className="flex-1">⚠️ {n}</span>
+          <button className="shrink-0 underline" onClick={() => setNotices(ns => ns.filter((_, j) => j !== i))}>知道了</button>
+        </div>
+      ))}
+      {!dbRootDir && !state.is_sample && (
+        <div role="status" className="rounded-md border border-amber-500 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+          尚未設定資料夾：目前的資料只存在這台電腦的程式暫存裡，清除瀏覽資料或重灌就會不見。請按工具列的資料夾圖示設定一個資料夾（例如雲端硬碟裡的資料夾）。
+        </div>
+      )}
+      {state.is_sample && (
+        <div role="status" className="rounded-md border border-sky-500 bg-sky-50 dark:bg-sky-950/30 px-4 py-3 text-sm text-sky-900 dark:text-sky-200">
+          目前顯示的是<strong>示範資料</strong>，不是你的資產，也不會自動寫入資料夾。要開始記錄自己的資料，請按右上角「重設 → 清空所有資料」。
         </div>
       )}
       {/* Header */}
@@ -887,7 +1154,7 @@ export default function Dashboard() {
 
         {/* ── Tab 6: 持倉明細 ── */}
         <TabsContent value="holdings">
-          <HoldingsTable state={state} onUpdate={commit} blurred={blurred} />
+          <HoldingsTable state={state} onUpdate={editState} blurred={blurred} />
         </TabsContent>
 
         {/* ── Tab 7: 交易紀錄 ── */}
@@ -1002,13 +1269,13 @@ export default function Dashboard() {
         open={emergencyOpen}
         onClose={() => setEmergencyOpen(false)}
         state={state}
-        onSave={ef => commit({ ...state, emergency_fund: ef })}
+        onSave={ef => editState({ ...state, emergency_fund: ef })}
       />
       <CategorySettingsDialog
         open={categoryOpen}
         onClose={() => setCategoryOpen(false)}
         state={state}
-        onUpdate={commit}
+        onUpdate={editState}
       />
       <TransactionDialog
         open={txOpen}
@@ -1034,10 +1301,10 @@ export default function Dashboard() {
       <DbConfigDialog
         open={dbOpen}
         onClose={() => setDbOpen(false)}
-        currentState={state}
         rootDir={dbRootDir}
         onRootDirChange={handleRootDirChange}
-        onLoad={(s, _date) => commit(s)}
+        onReload={handleImport}
+        onSaveNow={handleExport}
       />
       <EditTransactionDialog
         open={!!editingTx}

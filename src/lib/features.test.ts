@@ -1,3 +1,4 @@
+import { getTaiwanToday } from './dateUtils'
 /**
  * v0.4.2 新功能測試
  * Feature 1 — computeCostBases（個股成本基礎 + 未實現損益）
@@ -202,11 +203,16 @@ describe('new_position — 重複建立同一台股標的（v0.5.0 回報 bug）
   })
 
   // ── Case 6: 重複 new_position 後 price 更新為最後一筆 ─────────────────────
-  it('重複 new_position：price 更新為最後一筆的成交價', () => {
+  // 2026-09-30 盲測：補登過去日期的交易會把「今天的現價」改成當時的成交價（總資產與再平衡都算錯）。
+  // 規則改為：只有今天的成交價才更新現價。
+  it('重複 new_position：今天的成交價會更新現價，過去日期的不會', () => {
     let s = freshState()
     s = applyTransaction(s as AppState, np('a', '2026-06-18', 1000, 170) as Parameters<typeof applyTransaction>[1])
+    const before = s.holdings.find(h => h.symbol === '0050')!.price
     s = applyTransaction(s as AppState, np('b', '2026-06-22', 1000, 185) as Parameters<typeof applyTransaction>[1])
-    expect(s.holdings.find(h => h.symbol === '0050')!.price).toBe(185)
+    expect(s.holdings.find(h => h.symbol === '0050')!.price).toBe(before)
+    s = applyTransaction(s as AppState, np('c', getTaiwanToday(), 1000, 190) as Parameters<typeof applyTransaction>[1])
+    expect(s.holdings.find(h => h.symbol === '0050')!.price).toBe(190)
   })
 
   // ── Case 7: computeCostBases 與 h.shares 一致 ─────────────────────────────

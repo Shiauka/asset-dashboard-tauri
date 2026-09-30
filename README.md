@@ -10,7 +10,7 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.7.1 | [asset-dashboard_0.7.1_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.7.1/asset-dashboard_0.7.1_x64-setup.exe) |
+| Windows 10 / 11 | v0.8.0 | [asset-dashboard_0.8.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.8.0/asset-dashboard_0.8.0_x64-setup.exe) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
@@ -180,15 +180,26 @@ npm run test:update # 計算邏輯「刻意」改動、確認新結果正確後�
 
 第一次啟動後，點擊工具列的 📁 圖示，設定「根目錄」路徑（例如 `C:\Users\你的帳號\Documents\AssetDB`）。
 
-之後每次手動點「儲存」或新增交易時，會在根目錄寫入以下檔案：
+之後新增交易、修改持倉或設定、更新報價、切回視窗時都會自動存檔，在根目錄寫入以下檔案：
 
 | 檔案 / 資料夾 | 說明 |
 |------|------|
 | `snapshots/YYYY-MM.json` | 月份化持倉快照（單檔存該月所有日期的 map，含持股、現金、匯率、退休設定）|
 | `transactions.json` | 所有交易記錄（全域共用，不隨日期重複）|
-| `sync.json` | 與帳務管家雙向 sync 的 ID 清單，防止重複匯入 |
+| `sync.json` | 與帳務管家雙向 sync 的 ID 清單，防止重複匯入（只在有使用帳務管家時出現）|
+| `snapshots/backup/` | 每個月快照的「上一版」，覆蓋前自動保留 |
+| `backup/daily/YYYY-MM-DD/` | 每天第一次開啟或存檔時的整份資料備份，保留最近 14 天 |
+| `backup/corrupt/` | 讀不懂的損毀檔案會先搬到這裡保存，絕不直接刪除或覆蓋 |
 
 再次開啟 app 時，自動讀取最新快照與交易記錄，重建歷史走勢圖。
+
+### 資料保護
+
+- **不會寫壞檔案**：所有寫入都是「先寫暫存檔、完成後才替換」；一次要改多個檔案時會先記錄在 `.journal.json`，中途被關掉或當機，下次開啟會自動補完。
+- **檔案壞掉會自動修復或停止寫入**：快照檔損毀時會從 `snapshots/backup/` 或每日備份自動修復並提示；無法修復時畫面頂端會顯示紅色說明，並**停止所有儲存**，不會用不完整的資料覆蓋。
+- **找不到資料夾**（隨身碟沒插、雲端未同步、資料夾改名）時會明確提示並停止讀寫，不會自己建一個空資料夾。
+- **同一時間只能開一個視窗**；若資料夾被其他程式改過，存檔前會發現並請你重新載入，不會互相覆蓋。
+- 手動救回資料：關閉程式後，從 `backup/daily/` 找最近日期的同名檔案複製回原位置即可。
 
 所有資料保留在本機，不上傳任何伺服器。
 

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Globe, Loader2 } from 'lucide-react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
@@ -28,6 +28,9 @@ export default function PriceUpdateDialog({ open, onClose, state, onUpdate }: Pr
     setPrices(Object.fromEntries(state.holdings.map(h => [h.symbol, String(h.price)])))
     setFetchStatus(null)
   }
+  // 由外部控制開關時 onOpenChange 不會觸發，所以每次打開都要主動讀一次畫面上的最新價格
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (open) handleOpen() }, [open])
 
   const handleAutoFetch = async () => {
     setFetching(true)

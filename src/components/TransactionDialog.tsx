@@ -131,7 +131,8 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
   const selectHolding = (sym: string) => {
     setSymbol(sym)
     const h = holdings.find(h => h.symbol === sym)
-    if (h) { setCurrency(h.currency); setPrice(String(h.price)); setCashBank('') }
+    // 換成這檔的現價後金額要跟著重算，否則會存成「股數 × 新價格 ≠ 金額」的交易
+    if (h) { setCurrency(h.currency); setPrice(String(h.price)); setCashBank(''); recalc(shares, String(h.price)) }
   }
 
   const reset = () => {
@@ -145,6 +146,13 @@ export default function TransactionDialog({ open, onClose, onSubmit, holdings, c
   }
 
   const handleSubmit = () => {
+    // 日期先在這裡檢查：擋下時對話框不關、已填的內容不會不見
+    const t = new Date(`${date}T00:00:00Z`)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(t.getTime()) || t.toISOString().slice(0, 10) !== date) {
+      alert(`日期格式不正確：「${date}」。請輸入像 2026-09-30 這樣的日期。`)
+      return
+    }
+    if (date > getTaiwanToday() && !confirm(`日期 ${date} 在未來，確定要這樣記嗎？`)) return
     if (isStockTx) {
       const tx: Transaction & { category?: Category } = {
         id: `${Date.now()}`,

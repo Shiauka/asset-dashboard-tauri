@@ -1,7 +1,7 @@
 // 對真實共用資料夾跑同步健檢。
 //
 // 用法：
-//   cargo run --example sync_check -- "E:\資產配置\Test"
+//   cargo run --example sync_check -- "E:\理財\data"
 //
 // 印出五大不變量的檢查結果；有 error 等級問題時 exit code = 2。
 

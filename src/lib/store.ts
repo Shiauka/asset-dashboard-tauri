@@ -75,7 +75,14 @@ export function loadState(): AppState {
 
 export function saveState(state: AppState): void {
   if (typeof window === 'undefined') return
-  localStorage.setItem(KEY, JSON.stringify(state))
+  // 本機暫存只是鏡像；空間不足等錯誤不可中斷後續的存檔流程
+  try { localStorage.setItem(KEY, JSON.stringify(state)) } catch {}
+}
+
+/** 從來沒有存過本機資料（全新使用者，畫面會是示範資料） */
+export function isFirstRun(): boolean {
+  if (typeof window === 'undefined') return false
+  try { return localStorage.getItem(KEY) == null } catch { return false }
 }
 
 export function resetState(): AppState {
@@ -138,7 +145,8 @@ export function applyTransaction(
       // Holding already exists — accumulate shares (same semantics as buy)
       const h = { ...next.holdings[exists] }
       h.shares = (h.shares ?? 0) + (tx.shares ?? 0)
-      if (tx.price) h.price = tx.price
+      // 只有今天（含以後）的成交價才代表現價；補登過去日期的交易不可蓋掉現價
+      if (tx.price && tx.date >= getTaiwanToday()) h.price = tx.price
       next.holdings = [...next.holdings]
       next.holdings[exists] = h
     }
@@ -160,7 +168,7 @@ export function applyTransaction(
     if (idx >= 0) {
       const h = { ...next.holdings[idx] }
       h.shares = tx.type === 'buy' ? h.shares + tx.shares : h.shares - tx.shares
-      h.price = tx.price
+      if (tx.date >= getTaiwanToday()) h.price = tx.price
       next.holdings = [...next.holdings]
       next.holdings[idx] = h
     }

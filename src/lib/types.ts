@@ -93,6 +93,8 @@ export interface AppState {
   categories?: CategoryDef[]
   // 緊急備用金。可選：未設定 = 不啟用，所有計算與加入此功能前完全相同。
   emergency_fund?: EmergencyFund
+  // 示範資料（全新使用者看到的範例）。為 true 時不會自動寫入資料夾。
+  is_sample?: boolean
 }
 
 export interface CategorySummary {
