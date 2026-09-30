@@ -48,6 +48,12 @@ export default function Dashboard() {
   const [categoryOpen, setCategoryOpen] = useState(false)
   const [emergencyOpen, setEmergencyOpen] = useState(false)
   const [dbRootDir, setDbRootDir] = useState<string | null>(null)
+  // 資料檔損毀／存檔失敗的警告。以前這些錯誤都被 .catch(() => {}) 吞掉，
+  // 9 月快照整月歸零時畫面完全沒提示，還拿 8/31 的舊狀態繼續跑（2026-09-30）。
+  const [dataAlert, setDataAlert] = useState<string | null>(null)
+  // 有月份檔損毀且無備份時停止自動存檔：此時記憶體裡是較早月份的舊狀態，
+  // 存下去會把錯的資料寫成那個月的新檔案。
+  const saveBlockedRef = useRef(false)
   const [rebalanceCcy, setRebalanceCcy] = useState<'all' | 'TWD' | 'USD'>('all')
   const importRef = useRef<HTMLInputElement>(null)
   const resetMenuRef = useRef<HTMLDivElement>(null)
@@ -96,7 +102,17 @@ export default function Dashboard() {
 
       if (rootDir) {
         try {
-          const body = await invoke<{ ok?: boolean; state?: AppState; date?: string }>('load_snapshots')
+          const body = await invoke<{ ok?: boolean; state?: AppState; date?: string; brokenFiles?: string[]; recoveredFiles?: string[]; cashMismatches?: { bank: string; dashboard: number; ledger: number }[]; backupError?: string | null }>('load_snapshots')
+          if (body.brokenFiles?.length) {
+            saveBlockedRef.current = true
+            setDataAlert(`快照檔損毀且沒有備份：${body.brokenFiles.join('、')}。目前顯示的是 ${body.date ?? '較早'} 的資料，已暫停自動存檔以免寫入錯誤資料。請不要刪除損毀的檔案，先找 Claude 修復。`)
+          } else if (body.cashMismatches?.length) {
+            setDataAlert(`現金餘額跟帳務管家帳目對不上：${body.cashMismatches.map(m => `${m.bank} 看板 ${m.dashboard.toLocaleString()}／帳務管家 ${m.ledger.toLocaleString()}`).join('；')}。以帳務管家為準，請找 Claude 對帳。`)
+          } else if (body.backupError) {
+            setDataAlert(`今日自動備份失敗：${body.backupError}`)
+          } else if (body.recoveredFiles?.length) {
+            setDataAlert(`快照檔 ${body.recoveredFiles.join('、')} 損毀，已自動改用備份讀取（最多少了最後一次存檔），下次存檔會自動修復。`)
+          }
           if (body.ok && body.state) {
             const merged: AppState = {
               ...INITIAL_STATE,
@@ -121,7 +137,8 @@ export default function Dashboard() {
                 if (price !== null && price > 0) next = updateHoldingPrice(next, sym, price)
               next = addSnapshot(next, totalAssetsTwd(next))
               commit(next)
-              if (rootDir) invoke('save_snapshot', { state: next }).catch(() => {})
+              if (rootDir && !saveBlockedRef.current)
+                invoke('save_snapshot', { state: next }).catch(e => setDataAlert(`自動存檔失敗：${String(e)}`))
             }).catch(() => {})
 
             return
@@ -138,7 +155,7 @@ export default function Dashboard() {
   // commit 合併後的 state 再存檔 —— 避免看板開著沒重啟時，用記憶體裡的舊
   // cash_accounts 把帳務管家同一時間新增的異動蓋掉。
   const saveToDb = useCallback(async (next: AppState): Promise<void> => {
-    if (!dbRootDir) return
+    if (!dbRootDir || saveBlockedRef.current) return
     let toSave = next
     try {
       const body = await invoke<{ changed?: boolean; state?: AppState }>('refresh_budget_sync', { state: next })
@@ -147,7 +164,7 @@ export default function Dashboard() {
         commit(toSave)
       }
     } catch {}
-    await invoke('save_snapshot', { state: toSave }).catch(() => {})
+    await invoke('save_snapshot', { state: toSave }).catch(e => setDataAlert(`自動存檔失敗：${String(e)}`))
   }, [dbRootDir, commit])
 
   // 切回這個視窗時自動重新比對一次帳務管家資料，不用等重開 App 或手動按「匯入」。
@@ -181,7 +198,8 @@ export default function Dashboard() {
 
   const retroactiveDbUpdate = useCallback((tx: Transaction, direction: 1 | -1 = 1): Promise<void> => {
     if (!dbRootDir || tx.date >= getTaiwanToday()) return Promise.resolve()
-    return invoke('retroactive_update', { tx, direction }).then(() => {}).catch(() => {})
+    return invoke('retroactive_update', { tx, direction }).then(() => {})
+      .catch(e => setDataAlert(`回填歷史快照失敗：${String(e)}`))
   }, [dbRootDir])
 
   const handleTransaction = useCallback(async (tx: Transaction) => {
@@ -387,6 +405,12 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-background p-4 md:p-6 space-y-6">
+      {dataAlert && (
+        <div role="alert" className="flex items-start gap-3 rounded-md border border-red-500 bg-red-50 dark:bg-red-950/40 px-4 py-3 text-sm text-red-700 dark:text-red-300">
+          <span className="flex-1">⚠️ {dataAlert}</span>
+          <button className="shrink-0 underline" onClick={() => setDataAlert(null)}>關閉</button>
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>

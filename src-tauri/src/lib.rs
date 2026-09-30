@@ -55,6 +55,119 @@ fn is_month_file(name: &str) -> bool {
         && s[5..7].chars().all(|c| c.is_ascii_digit())
 }
 
+// ── 安全寫檔 ──────────────────────────────────────────────────────────────────
+// 🔴 資料檔一律用 atomic_write，不可直接 tokio::fs::write / std::fs::write。
+// fs::write 會先把檔案截成 0 bytes 再寫入，寫到一半被中斷（關 app、當機、斷電）
+// 檔案就只剩空殼——2026-09-29 9 月快照整月歸零就是這樣發生的（v0.6.0 只修了
+// 「讀到壞檔就覆蓋」跟並發，沒修這個）。做法：同目錄寫暫存檔 → fsync → rename
+// 蓋過正式檔；rename 在同一個磁碟上是原子的，正式檔永遠是完整的舊版或新版。
+
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tmp_path_for(path: &std::path::Path) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    path.with_file_name(format!(".{}.{}-{}.tmp", name, std::process::id(), seq))
+}
+
+async fn atomic_write(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = tmp_path_for(path);
+    let result = async {
+        let mut f = tokio::fs::File::create(&tmp).await?;
+        f.write_all(contents.as_ref()).await?;
+        f.sync_all().await?;
+        drop(f);
+        // Windows 上目標檔正被別的程式（例如帳務管家）開著讀取時 rename 會暫時失敗，重試幾次
+        let mut last_err = None;
+        for _ in 0..10 {
+            match tokio::fs::rename(&tmp, path).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        }
+        Err(last_err.unwrap())
+    }.await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+fn atomic_write_sync(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = tmp_path_for(path);
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_ref())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+// 每個月快照檔在被覆蓋前，先把「目前這份完整可解析的版本」存到 snapshots/backup/。
+// 萬一正式檔還是壞了（手動編輯、磁碟問題、未知的寫入路徑），讀取端會自動改用備份，
+// 最多損失最後一次存檔，而不是整個月。
+fn month_backup_path(month_file: &std::path::Path) -> PathBuf {
+    let name = month_file.file_name().map(|n| n.to_owned()).unwrap_or_default();
+    month_file.parent().map(|p| p.join("backup")).unwrap_or_else(|| PathBuf::from("backup")).join(name)
+}
+
+type SnapMap = serde_json::Map<String, serde_json::Value>;
+
+enum MonthRead {
+    /// 正式檔與備份都不存在（新的月份）
+    Missing,
+    /// 讀到資料；bool = 是否因正式檔損毀/遺失而改用備份
+    Loaded(SnapMap, bool),
+    /// 正式檔壞了，而且沒有可用的備份
+    Broken(String),
+}
+
+async fn read_month_map(path: &std::path::Path) -> MonthRead {
+    let main_err = match tokio::fs::read_to_string(path).await {
+        Ok(raw) => match serde_json::from_str::<SnapMap>(&raw) {
+            Ok(map) => return MonthRead::Loaded(map, false),
+            Err(e) => Some(format!("{}（{} bytes）", e, raw.len())),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(e.to_string()),
+    };
+    if let Ok(raw) = tokio::fs::read_to_string(month_backup_path(path)).await {
+        if let Ok(map) = serde_json::from_str::<SnapMap>(&raw) {
+            return MonthRead::Loaded(map, true);
+        }
+    }
+    match main_err {
+        None => MonthRead::Missing,
+        Some(e) => MonthRead::Broken(e),
+    }
+}
+
+async fn write_month_map(path: &std::path::Path, map: &SnapMap) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&serde_json::Value::Object(map.clone()))
+        .map_err(|e| e.to_string())?;
+    // 只有「正式檔目前完整可解析」才更新備份，壞檔絕不蓋掉好的備份
+    if let Ok(raw) = tokio::fs::read_to_string(path).await {
+        if serde_json::from_str::<SnapMap>(&raw).is_ok() {
+            let bak = month_backup_path(path);
+            if let Some(dir) = bak.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
+            atomic_write(&bak, raw).await.map_err(|e| format!("備份 {} 失敗：{}", bak.display(), e))?;
+        }
+    }
+    atomic_write(path, json).await.map_err(|e| format!("寫入 {} 失敗：{}", path.display(), e))
+}
+
 fn enrich_snapshot(date: &str, state: &serde_json::Value) -> Option<serde_json::Value> {
     let fx = state["exchange_rate"].as_f64().unwrap_or(1.0);
     let holdings = state["holdings"].as_array()?;
@@ -267,21 +380,17 @@ async fn apply_retroactive_delta(
     let mut updated: Vec<String> = Vec::new();
     for mf in &month_files {
         let path = snap_dir.join(mf);
-        if let Ok(raw) = tokio::fs::read_to_string(&path).await {
-            if let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) {
-                let mut changed = false;
-                for (date, state) in map.iter_mut() {
-                    if date.as_str() >= tx_date.as_str() && date.as_str() < today {
-                        apply_delta(state, tx, sign);
-                        updated.push(date.clone());
-                        changed = true;
-                    }
+        if let MonthRead::Loaded(mut map, _) = read_month_map(&path).await {
+            let mut changed = false;
+            for (date, state) in map.iter_mut() {
+                if date.as_str() >= tx_date.as_str() && date.as_str() < today {
+                    apply_delta(state, tx, sign);
+                    updated.push(date.clone());
+                    changed = true;
                 }
-                if changed {
-                    if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
-                        let _ = tokio::fs::write(&path, json).await;
-                    }
-                }
+            }
+            if changed {
+                let _ = write_month_map(&path, &map).await;
             }
         }
     }
@@ -491,6 +600,23 @@ fn plan_budget_syncs(
 /// 找到既有對應紀錄的情況；回傳 (dash_txs 內要更新的 index, 新的看板交易)。
 /// 新增/刪除交由 plan_budget_syncs / 刪除偵測處理，這裡只處理「內容不一樣就換掉」
 /// （例如編輯金額、日期、分類/備註、轉帳的對應帳戶）。
+/// 內容比對，數字只比「值」：舊版存成整數 2456、重建出來是 2456.0，serde_json 的 == 會判定不同。
+/// 以前因此每次開 app 都把一批 6 月交易當成「帳務管家改過」，對所有歷史快照先扣回再加上
+/// （兩次分開寫檔，中間被打斷就永久漂移），也是每次開 app 都重寫 6～8 月快照的原因。
+fn json_same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+            _ => x == y,
+        },
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| json_same(p, q)),
+        (Value::Object(x), Value::Object(y)) => x.len() == y.len()
+            && x.iter().all(|(k, v)| y.get(k).map_or(false, |w| json_same(v, w))),
+        _ => a == b,
+    }
+}
+
 fn plan_budget_updates(
     budget_txs: &[serde_json::Value],
     acc_map: &HashMap<String, (String, String)>,
@@ -507,7 +633,7 @@ fn plan_budget_updates(
     for (_tid, txs) in &transfer_groups {
         if let Some((_ids, primary, want)) = resolve_transfer_group(txs, acc_map) {
             if let Some(pos) = find_dash_pos_for_budget(dash_txs, &primary) {
-                if dash_txs[pos] != want {
+                if !json_same(&dash_txs[pos], &want) {
                     updates.push((pos, want));
                 }
             }
@@ -519,7 +645,7 @@ fn plan_budget_updates(
             let id = tx["id"].as_str().unwrap_or("").to_string();
             let want = build_cash_tx(tx, &bc, note_of(tx));
             if let Some(pos) = find_dash_pos_for_budget(dash_txs, &id) {
-                if dash_txs[pos] != want {
+                if !json_same(&dash_txs[pos], &want) {
                     updates.push((pos, want));
                 }
             }
@@ -575,9 +701,7 @@ async fn migrate_daily_to_monthly(root_dir: &PathBuf, snap_dir: &PathBuf) {
     // Write monthly files
     for (month, map) in &by_month {
         let month_file = snap_dir.join(format!("{}.json", month));
-        if let Ok(json) = serde_json::to_string_pretty(&serde_json::Value::Object(map.clone())) {
-            let _ = tokio::fs::write(&month_file, json).await;
-        }
+        let _ = write_month_map(&month_file, map).await;
     }
     // Old daily files are left in place as backup — user can delete manually
 }
@@ -600,7 +724,7 @@ fn set_db_config(app: AppHandle, root_dir: Option<String>) -> Result<(), String>
     }
     let json = serde_json::to_string_pretty(&serde_json::json!({ "rootDir": root_dir }))
         .map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    atomic_write_sync(&path, json).map_err(|e| e.to_string())
 }
 
 // ── Shared: budget → dashboard cash-transaction sync ────────────────────────
@@ -639,21 +763,20 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
 
     // 讀取所有 budget 交易：優先 budget/ 月份資料夾，fallback 舊格式 budget.json
     let budget_tx_dir = PathBuf::from(root_dir).join("budget");
+    // 🔴 任何一個月檔讀不到／解析失敗就整個中止同步：靜默跳過那個月的話，
+    // 那個月已同步的交易會被下面的「刪除偵測」當成已刪除，把看板交易刪掉並回沖現金。
     let budget_transactions: Vec<serde_json::Value> = if budget_tx_dir.exists() {
         let mut all = Vec::new();
-        if let Ok(mut rd) = tokio::fs::read_dir(&budget_tx_dir).await {
-            let mut mfs: Vec<String> = Vec::new();
-            while let Ok(Some(e)) = rd.next_entry().await {
-                let name = e.file_name().to_string_lossy().to_string();
-                if is_month_file(&name) { mfs.push(name); }
-            }
-            for mf in mfs {
-                if let Ok(raw) = tokio::fs::read_to_string(budget_tx_dir.join(&mf)).await {
-                    if let Ok(txs) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
-                        all.extend(txs);
-                    }
-                }
-            }
+        let Ok(mut rd) = tokio::fs::read_dir(&budget_tx_dir).await else { return false };
+        let mut mfs: Vec<String> = Vec::new();
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            if is_month_file(&name) { mfs.push(name); }
+        }
+        for mf in mfs {
+            let Ok(raw) = tokio::fs::read_to_string(budget_tx_dir.join(&mf)).await else { return false };
+            let Ok(txs) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else { return false };
+            all.extend(txs);
         }
         all
     } else {
@@ -667,6 +790,10 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
     let mut synced_ids: Vec<String> = sync["budget_to_dashboard"]
         .as_array().cloned().unwrap_or_default()
         .iter().filter_map(|v| v.as_str().map(String::from)).collect();
+    // sync.json 只是「已同步清單」的快取，真相是看板交易上記的 budget_tx_id。
+    // sync.json 遺失、或被帳務管家用舊版蓋回去時，只看它會把已同步的交易再套一次，
+    // 現金重複計算。所以把看板交易引用到的 budget id 一律視為已同步。
+    heal_synced_ids(&mut synced_ids, &dash_txs);
     let mut changed = false;
 
     // budget 目前存在的所有 transaction id
@@ -750,16 +877,147 @@ async fn sync_budget_into_state(root_dir: &str, merged: &mut serde_json::Value) 
     if changed {
         merged["transactions"] = serde_json::json!(dash_txs);
         if let Ok(j) = serde_json::to_string_pretty(&merged["transactions"]) {
-            let _ = tokio::fs::write(&tx_path, j).await;
+            let _ = atomic_write(&tx_path, j).await;
         }
-        let mut merged_sync = sync.clone();
-        merged_sync["budget_to_dashboard"] = serde_json::json!(synced_ids);
-        if let Ok(j) = serde_json::to_string_pretty(&merged_sync) {
-            let _ = tokio::fs::write(&sync_path, j).await;
-        }
+        let _ = update_sync_key(&sync_path, "budget_to_dashboard", serde_json::json!(synced_ids)).await;
     }
 
     changed
+}
+
+/// 把看板交易上記錄的 budget id 併入已同步清單（見呼叫處註解）
+fn heal_synced_ids(synced_ids: &mut Vec<String>, dash_txs: &[serde_json::Value]) {
+    let mut seen: std::collections::HashSet<String> = synced_ids.iter().cloned().collect();
+    for t in dash_txs {
+        for k in ["budget_tx_id", "budget_tx_id_pair"] {
+            if let Some(id) = t[k].as_str() {
+                if !id.is_empty() && seen.insert(id.to_string()) {
+                    synced_ids.push(id.to_string());
+                }
+            }
+        }
+    }
+}
+
+/// sync.json 由看板與帳務管家兩支程式共用，各自負責一個 key。寫入前一刻重新讀最新版、
+/// 只換自己的 key，避免拿啟動時讀到的舊內容整份蓋回去、把對方剛寫的清單吃掉。
+/// 檔案存在但解析失敗時不寫（不能用空物件把對方的資料蓋掉）。
+async fn update_sync_key(path: &std::path::Path, key: &str, value: serde_json::Value) -> Result<(), String> {
+    let mut obj = match tokio::fs::read_to_string(path).await {
+        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|e| format!("sync.json 損毀，不寫入：{}", e))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !obj.is_object() { obj = serde_json::json!({}); }
+    obj[key] = value;
+    let j = serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?;
+    atomic_write(path, j).await.map_err(|e| e.to_string())
+}
+
+// ── 每日自動備份 ──────────────────────────────────────────────────────────────
+// 每天第一次開 app 時，把看板與帳務管家的資料檔整份複製到 <根目錄>/backup/daily/YYYY-MM-DD/，
+// 保留最近 14 天。月快照的 backup/ 只有上一版；這裡是「錯的資料被存了好幾天」時的退路
+// （2026-08、2026-09 兩次都只能靠交易紀錄＋歷史股價重建，有這個就能直接還原）。
+const DAILY_BACKUP_KEEP: usize = 14;
+
+async fn daily_backup(root: &std::path::Path, today: &str) -> Result<(), String> {
+    let base = root.join("backup").join("daily");
+    let dest = base.join(today);
+    if tokio::fs::metadata(&dest).await.is_ok() {
+        return Ok(());
+    }
+    let staging = base.join(format!(".{}.partial", today));
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    for sub in ["", "snapshots", "budget"] {
+        let src_dir = if sub.is_empty() { root.to_path_buf() } else { root.join(sub) };
+        let Ok(mut rd) = tokio::fs::read_dir(&src_dir).await else { continue };
+        let out_dir = if sub.is_empty() { staging.clone() } else { staging.join(sub) };
+        tokio::fs::create_dir_all(&out_dir).await.map_err(|e| e.to_string())?;
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            let is_file = e.file_type().await.map(|t| t.is_file()).unwrap_or(false);
+            if is_file && name.ends_with(".json") && !name.starts_with('.') {
+                tokio::fs::copy(e.path(), out_dir.join(&name)).await.map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    // 複製完整才改名成正式日期資料夾，中途失敗不會留下看似完整的半套備份
+    tokio::fs::rename(&staging, &dest).await.map_err(|e| e.to_string())?;
+
+    let mut days: Vec<String> = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&base).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.len() == 10 && is_date_file(&format!("{}.json", name)) { days.push(name); }
+        }
+    }
+    days.sort();
+    while days.len() > DAILY_BACKUP_KEEP {
+        let old = days.remove(0);
+        let _ = tokio::fs::remove_dir_all(base.join(old)).await;
+    }
+    Ok(())
+}
+
+// ── 現金餘額對帳 ──────────────────────────────────────────────────────────────
+// 帳務管家的帳目（期初餘額＋所有收支）是現金帳戶的真相；看板的 cash_accounts 是
+// 一路套交易「累積」出來的，任何一次同步漏套／重套都會永久漂移而且不會自己好。
+// 2026-06～09 三個台幣帳戶就這樣默默漂了三個月（元大 9/3 變 -32,148），直到祿哥
+// 看到負數才發現。每次載入都對一次帳，對不上就回報給前端顯示。
+fn compute_ledger_mismatches(
+    budget: &serde_json::Value,
+    budget_txs: &[serde_json::Value],
+    state: &serde_json::Value,
+    today: &str,
+) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let accounts = budget["accounts"].as_array().cloned().unwrap_or_default();
+    for acc in &accounts {
+        let (Some(id), Some(bank)) = (acc["id"].as_str(), acc["dashboard_bank_name"].as_str()) else { continue };
+        if bank.is_empty() { continue; }
+        let mut ledger = acc["initial_balance"].as_f64().unwrap_or(0.0);
+        for t in budget_txs {
+            if t["account_id"].as_str() != Some(id) { continue; }
+            if t["date"].as_str().map_or(true, |d| d > today) { continue; } // 未來的分期/週期交易不算
+            let amt = t["amount"].as_f64().unwrap_or(0.0);
+            match t["type"].as_str() {
+                Some("income") => ledger += amt,
+                Some("expense") => ledger -= amt,
+                _ => {}
+            }
+        }
+        let dash = state["cash_accounts"].as_array()
+            .and_then(|arr| arr.iter().find(|c| c["bank"].as_str() == Some(bank)))
+            .and_then(|c| c["amount"].as_f64());
+        if let Some(dash) = dash {
+            if (dash - ledger).abs() > 1.0 {
+                out.push(serde_json::json!({
+                    "bank": bank,
+                    "dashboard": (dash * 100.0).round() / 100.0,
+                    "ledger": (ledger * 100.0).round() / 100.0,
+                }));
+            }
+        }
+    }
+    out
+}
+
+async fn ledger_cash_mismatches(root_dir: &str, state: &serde_json::Value) -> Vec<serde_json::Value> {
+    let dir = PathBuf::from(root_dir);
+    let Ok(raw) = tokio::fs::read_to_string(dir.join("budget.json")).await else { return Vec::new() };
+    let Ok(budget) = serde_json::from_str::<serde_json::Value>(&raw) else { return Vec::new() };
+    let mut txs = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(dir.join("budget")).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !is_month_file(&name) { continue; }
+            if let Ok(raw) = tokio::fs::read_to_string(e.path()).await {
+                if let Ok(v) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) { txs.extend(v); }
+            }
+        }
+    }
+    compute_ledger_mismatches(&budget, &txs, state, &get_taiwan_date())
 }
 
 #[tauri::command]
@@ -798,20 +1056,20 @@ async fn load_snapshots(app: AppHandle, lock: tauri::State<'_, SnapshotLock>) ->
     // Collect all (date, state) pairs across all monthly files, sorted
     let mut all_entries: Vec<(String, serde_json::Value)> = Vec::new();
     let mut broken_files: Vec<String> = Vec::new();
+    let mut recovered_files: Vec<String> = Vec::new();
     for mf in &month_files {
         let path = snap_dir.join(mf);
-        match tokio::fs::read_to_string(&path).await {
-            Ok(raw) => match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) {
-                Ok(map) => {
-                    for (date, state) in map {
-                        all_entries.push((date, state));
-                    }
+        match read_month_map(&path).await {
+            MonthRead::Loaded(map, from_backup) => {
+                if from_backup { recovered_files.push(mf.clone()); }
+                for (date, state) in map {
+                    all_entries.push((date, state));
                 }
-                // 解析失敗（檔案損毀/正在被其他呼叫寫入）：不要靜默丟棄整個月，
-                // 記錄下來讓前端能顯示警告，而不是讓使用者以為那個月的資料本來就不存在。
-                Err(_) => broken_files.push(mf.clone()),
-            },
-            Err(_) => broken_files.push(mf.clone()),
+            }
+            MonthRead::Missing => {}
+            // 損毀且沒有備份：不要靜默丟棄整個月，回報給前端顯示警告並停止自動存檔，
+            // 否則 app 會拿上個月的舊狀態繼續跑，使用者以為那個月的資料本來就不存在。
+            MonthRead::Broken(_) => broken_files.push(mf.clone()),
         }
     }
     all_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -835,15 +1093,26 @@ async fn load_snapshots(app: AppHandle, lock: tauri::State<'_, SnapshotLock>) ->
     merged["snapshots"] = serde_json::json!(snaps);
 
     // Load transactions from dedicated file
+    // 🔴 存在但解析失敗時不能當成「沒有交易」：前端會拿空清單存檔，把整份交易紀錄清掉。
     let tx_path = PathBuf::from(&root_dir).join("transactions.json");
-    if let Ok(raw) = tokio::fs::read_to_string(&tx_path).await {
-        if let Ok(txs) = serde_json::from_str::<serde_json::Value>(&raw) {
-            merged["transactions"] = txs;
-        }
+    let mut tx_ok = true;
+    match tokio::fs::read_to_string(&tx_path).await {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(txs) => merged["transactions"] = txs,
+            Err(_) => { tx_ok = false; broken_files.push("transactions.json".into()); }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => { tx_ok = false; broken_files.push("transactions.json".into()); }
     }
 
+    // 每天第一次載入時備份整個資料夾（失敗不影響開啟，但回報給前端）
+    let backup_error = daily_backup(&dir, &get_taiwan_date()).await.err();
+
     // ── budget → dashboard 現金交易同步（邏輯見共用函式 sync_budget_into_state）──
-    sync_budget_into_state(&root_dir, &mut merged).await;
+    if tx_ok {
+        sync_budget_into_state(&root_dir, &mut merged).await;
+    }
+    let cash_mismatches = ledger_cash_mismatches(&root_dir, &merged).await;
 
     Ok(serde_json::json!({
         "ok": true,
@@ -851,6 +1120,9 @@ async fn load_snapshots(app: AppHandle, lock: tauri::State<'_, SnapshotLock>) ->
         "date": latest_date,
         "dates": dates,
         "brokenFiles": broken_files,
+        "recoveredFiles": recovered_files,
+        "cashMismatches": cash_mismatches,
+        "backupError": backup_error,
     }))
 }
 
@@ -869,8 +1141,14 @@ async fn save_snapshot(
 
     // Save transactions to dedicated file
     if let Some(txs) = state.get("transactions") {
+        let tx_file = dir.join("transactions.json");
+        if let Ok(raw) = tokio::fs::read_to_string(&tx_file).await {
+            if serde_json::from_str::<serde_json::Value>(&raw).is_err() {
+                return Err("transactions.json 損毀，為避免用不完整的交易清單覆蓋，本次存檔已中止".into());
+            }
+        }
         let tx_json = serde_json::to_string_pretty(txs).map_err(|e| e.to_string())?;
-        tokio::fs::write(dir.join("transactions.json"), tx_json).await.map_err(|e| e.to_string())?;
+        atomic_write(&dir.join("transactions.json"), tx_json).await.map_err(|e| e.to_string())?;
     }
 
     // Lean state: strip transactions and snapshots
@@ -887,21 +1165,19 @@ async fn save_snapshot(
     // 資料把整個月已存在的歷史快照覆蓋掉（2026-08-19 踩雷：8月只剩8/19一筆的根因）。
     let month_key = &date[..7];
     let month_file = snap_dir.join(format!("{}.json", month_key));
-    let mut month_map: serde_json::Map<String, serde_json::Value> = match tokio::fs::read_to_string(&month_file).await {
-        Ok(raw) => serde_json::from_str(&raw).map_err(|e| format!(
-            "讀取 {} 失敗（檔案可能損毀），為避免覆蓋已有的歷史資料，本次存檔已中止：{}",
+    // 正式檔壞了但 backup/ 有完整的上一版 → 用備份接續（等於自動修復，最多少最後一次存檔）。
+    let (mut month_map, recovered) = match read_month_map(&month_file).await {
+        MonthRead::Missing => (serde_json::Map::new(), false),
+        MonthRead::Loaded(map, from_backup) => (map, from_backup),
+        MonthRead::Broken(e) => return Err(format!(
+            "讀取 {} 失敗（檔案可能損毀，且沒有可用的備份），為避免覆蓋已有的歷史資料，本次存檔已中止：{}",
             month_file.display(), e
-        ))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
-        Err(e) => return Err(format!("讀取 {} 失敗：{}", month_file.display(), e)),
+        )),
     };
     month_map.insert(date.clone(), lean);
+    write_month_map(&month_file, &month_map).await?;
 
-    let json = serde_json::to_string_pretty(&serde_json::Value::Object(month_map))
-        .map_err(|e| e.to_string())?;
-    tokio::fs::write(&month_file, json).await.map_err(|e| e.to_string())?;
-
-    Ok(serde_json::json!({ "ok": true, "date": date }))
+    Ok(serde_json::json!({ "ok": true, "date": date, "recovered": recovered }))
 }
 
 // 存檔前 / 視窗取得焦點時呼叫：把前端目前的 state 跟 budget 端最新資料重新比對，
@@ -1480,5 +1756,250 @@ mod tests {
         assert!(updated.is_empty());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── 2026-09-30：9 月快照被截成 0 bytes（寫到一半中斷）的回歸測試 ──────────
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("adb_test_{}", std::process::id()))
+            .join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    // 關卡：正式程式碼（測試模組以外）不准直接呼叫 fs::write，
+    // 一律走 atomic_write / write_month_map，避免哪天新增寫檔路徑又繞過去。
+    #[test]
+    fn production_code_never_calls_raw_fs_write() {
+        let src = include_str!("lib.rs");
+        // 排除測試模組本身（mod tests { ... } 到第 0 欄的 }），其餘全部都算正式程式碼，
+        // 不假設測試模組在檔案最後
+        let mut in_tests = false;
+        let prod: String = src.lines().filter(|l| {
+            if l.starts_with("mod tests {") { in_tests = true; return false; }
+            if in_tests { if *l == "}" { in_tests = false; } return false; }
+            true
+        }).collect::<Vec<_>>().join("\n");
+        let offenders: Vec<(usize, &str)> = prod.lines().enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains("fs::write("))
+            .collect();
+        assert!(offenders.is_empty(), "直接 fs::write 會在中斷時留下 0 bytes 檔案：{:?}", offenders);
+    }
+
+    #[tokio::test]
+    async fn atomic_write_replaces_content_and_leaves_no_temp_file() {
+        let dir = fresh_dir("atomic_write");
+        let f = dir.join("2026-09.json");
+        atomic_write(&f, "{\"a\":1}").await.unwrap();
+        atomic_write(&f, "{\"a\":2}").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "{\"a\":2}");
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["2026-09.json".to_string()], "暫存檔沒清掉：{:?}", names);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_month_map_keeps_previous_good_version_as_backup() {
+        let dir = fresh_dir("month_backup");
+        let f = dir.join("2026-09.json");
+        let mut m = SnapMap::new();
+        m.insert("2026-09-01".into(), serde_json::json!({ "v": 1 }));
+        write_month_map(&f, &m).await.unwrap();
+        assert!(!month_backup_path(&f).exists(), "第一次寫入沒有舊版可備份");
+        m.insert("2026-09-02".into(), serde_json::json!({ "v": 2 }));
+        write_month_map(&f, &m).await.unwrap();
+        let bak: SnapMap = serde_json::from_str(&std::fs::read_to_string(month_backup_path(&f)).unwrap()).unwrap();
+        assert_eq!(bak.len(), 1, "備份應該是上一版（只有 9/1）");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 重現 9/29：正式檔被截成 0 bytes → 讀取改用備份、存檔用備份接續並修好正式檔，
+    // 而且壞掉的正式檔不能把好的備份蓋掉。
+    #[tokio::test]
+    async fn truncated_month_file_recovers_from_backup() {
+        let dir = fresh_dir("truncated_recover");
+        let f = dir.join("2026-09.json");
+        let mut m = SnapMap::new();
+        for d in 1..=28 { m.insert(format!("2026-09-{:02}", d), serde_json::json!({ "d": d })); }
+        write_month_map(&f, &m).await.unwrap();
+        m.insert("2026-09-29".into(), serde_json::json!({ "d": 29 }));
+        write_month_map(&f, &m).await.unwrap(); // 備份 = 1~28 日
+        std::fs::write(&f, "").unwrap();        // 模擬寫到一半被中斷
+
+        match read_month_map(&f).await {
+            MonthRead::Loaded(map, from_backup) => {
+                assert!(from_backup);
+                assert_eq!(map.len(), 28);
+            }
+            _ => panic!("應該要從備份讀回 28 天"),
+        }
+
+        // 存檔路徑：以備份為基礎加上今天，寫回正式檔；備份仍是完整的 28 天
+        let (mut map, recovered) = match read_month_map(&f).await {
+            MonthRead::Loaded(map, b) => (map, b),
+            _ => unreachable!(),
+        };
+        assert!(recovered);
+        map.insert("2026-09-30".into(), serde_json::json!({ "d": 30 }));
+        write_month_map(&f, &map).await.unwrap();
+        let main: SnapMap = serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(main.len(), 29);
+        let bak: SnapMap = serde_json::from_str(&std::fs::read_to_string(month_backup_path(&f)).unwrap()).unwrap();
+        assert_eq!(bak.len(), 28);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn broken_month_file_without_backup_is_reported_not_emptied() {
+        let dir = fresh_dir("broken_no_backup");
+        let f = dir.join("2026-09.json");
+        std::fs::write(&f, "").unwrap();
+        assert!(matches!(read_month_map(&f).await, MonthRead::Broken(_)));
+        assert!(matches!(read_month_map(&dir.join("2026-10.json")).await, MonthRead::Missing));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ledger_check_flags_drifted_cash_and_ignores_future_installments() {
+        let budget = serde_json::json!({ "accounts": [
+            { "id": "yt", "dashboard_bank_name": "元大 台幣現金", "initial_balance": 2912.0 },
+            { "id": "cc", "initial_balance": 100.0 }  // 沒對應看板帳戶（信用卡）→ 不檢查
+        ]});
+        let txs = vec![
+            serde_json::json!({ "account_id": "yt", "type": "income",  "amount": 40000.0, "date": "2026-08-11" }),
+            serde_json::json!({ "account_id": "yt", "type": "expense", "amount": 35060.0, "date": "2026-09-03" }),
+            serde_json::json!({ "account_id": "yt", "type": "expense", "amount": 999.0,   "date": "2026-10-03" }),
+        ];
+        let drifted = serde_json::json!({ "cash_accounts": [{ "bank": "元大 台幣現金", "amount": -32148.0 }] });
+        let got = compute_ledger_mismatches(&budget, &txs, &drifted, "2026-09-30");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0]["ledger"].as_f64(), Some(7852.0));
+        let ok = serde_json::json!({ "cash_accounts": [{ "bank": "元大 台幣現金", "amount": 7852.0 }] });
+        assert!(compute_ledger_mismatches(&budget, &txs, &ok, "2026-09-30").is_empty());
+    }
+
+    // sync.json 遺失時，看板交易上的 budget_tx_id 要被視為已同步，不能重複套用
+    #[test]
+    fn heal_synced_ids_recovers_from_lost_sync_json() {
+        let mut ids: Vec<String> = vec![];
+        let dash = vec![
+            serde_json::json!({ "budget_tx_id": "a" }),
+            serde_json::json!({ "budget_tx_id": "b", "budget_tx_id_pair": "c" }),
+            serde_json::json!({ "type": "buy" }),
+        ];
+        heal_synced_ids(&mut ids, &dash);
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        heal_synced_ids(&mut ids, &dash);
+        assert_eq!(ids.len(), 3, "不可重複加入");
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_reapply_budget_txs_when_sync_json_is_missing() {
+        let root = fresh_dir("lost_sync_json");
+        std::fs::create_dir_all(root.join("budget")).unwrap();
+        std::fs::write(root.join("budget.json"), serde_json::json!({ "accounts": [
+            { "id": "yt", "dashboard_bank_name": "元大 台幣現金", "currency": "TWD", "initial_balance": 0 }
+        ]}).to_string()).unwrap();
+        std::fs::write(root.join("budget").join("2026-09.json"), serde_json::json!([
+            { "id": "b1", "account_id": "yt", "type": "expense", "amount": 35060.0, "date": "2026-09-03", "category": "房貸利息" }
+        ]).to_string()).unwrap();
+        // 已同步過（看板交易帶 budget_tx_id），但 sync.json 不見了
+        let mut state = serde_json::json!({
+            "cash_accounts": [{ "bank": "元大 台幣現金", "currency": "TWD", "amount": 7852.0 }],
+            "transactions": [{ "id": "budget_b1", "budget_tx_id": "b1", "type": "cash_out",
+                "bank": "元大 台幣現金", "amount": 35060.0, "date": "2026-09-03", "currency": "TWD" }],
+        });
+        sync_budget_into_state(root.to_str().unwrap(), &mut state).await;
+        assert_eq!(state["cash_accounts"][0]["amount"].as_f64(), Some(7852.0), "不可再扣一次");
+        assert_eq!(state["transactions"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // budget 月檔壞掉 → 整個同步中止，不可把那個月已同步的交易當成「已刪除」回沖
+    #[tokio::test]
+    async fn sync_aborts_when_a_budget_month_file_is_broken() {
+        let root = fresh_dir("broken_budget_month");
+        std::fs::create_dir_all(root.join("budget")).unwrap();
+        std::fs::write(root.join("budget.json"), serde_json::json!({ "accounts": [
+            { "id": "yt", "dashboard_bank_name": "元大 台幣現金", "currency": "TWD", "initial_balance": 0 }
+        ]}).to_string()).unwrap();
+        std::fs::write(root.join("budget").join("2026-09.json"), "").unwrap();
+        std::fs::write(root.join("sync.json"), r#"{"budget_to_dashboard":["b1"]}"#).unwrap();
+        let mut state = serde_json::json!({
+            "cash_accounts": [{ "bank": "元大 台幣現金", "currency": "TWD", "amount": 7852.0 }],
+            "transactions": [{ "id": "budget_b1", "budget_tx_id": "b1", "type": "cash_out",
+                "bank": "元大 台幣現金", "amount": 35060.0, "date": "2026-09-03", "currency": "TWD" }],
+        });
+        let changed = sync_budget_into_state(root.to_str().unwrap(), &mut state).await;
+        assert!(!changed);
+        assert_eq!(state["cash_accounts"][0]["amount"].as_f64(), Some(7852.0));
+        assert_eq!(state["transactions"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn update_sync_key_keeps_the_other_apps_key_and_never_overwrites_broken_file() {
+        let dir = fresh_dir("sync_key");
+        let p = dir.join("sync.json");
+        std::fs::write(&p, r#"{"budget_to_dashboard":["a"],"dashboard_to_budget":["x","y"]}"#).unwrap();
+        update_sync_key(&p, "budget_to_dashboard", serde_json::json!(["a", "b"])).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(v["dashboard_to_budget"], serde_json::json!(["x", "y"]));
+        assert_eq!(v["budget_to_dashboard"], serde_json::json!(["a", "b"]));
+        std::fs::write(&p, "").unwrap();
+        assert!(update_sync_key(&p, "budget_to_dashboard", serde_json::json!([])).await.is_err());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn daily_backup_copies_once_per_day_and_keeps_14_days() {
+        let root = fresh_dir("daily_backup");
+        std::fs::create_dir_all(root.join("snapshots")).unwrap();
+        std::fs::create_dir_all(root.join("budget")).unwrap();
+        std::fs::write(root.join("transactions.json"), "[]").unwrap();
+        std::fs::write(root.join("snapshots").join("2026-09.json"), "{}").unwrap();
+        std::fs::write(root.join("budget").join("2026-09.json"), "[]").unwrap();
+        for d in 1..=20 {
+            daily_backup(&root, &format!("2026-09-{:02}", d)).await.unwrap();
+        }
+        let base = root.join("backup").join("daily");
+        let mut days: Vec<String> = std::fs::read_dir(&base).unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        days.sort();
+        assert_eq!(days.len(), 14);
+        assert_eq!(days[0], "2026-09-07");
+        let d = base.join("2026-09-20");
+        assert!(d.join("transactions.json").exists());
+        assert!(d.join("snapshots").join("2026-09.json").exists());
+        assert!(d.join("budget").join("2026-09.json").exists());
+        // 備份資料夾本身不能被遞迴備份進去
+        assert!(!d.join("backup").exists());
+        // 同一天第二次不重做（不會用當下可能已壞的檔案蓋掉當天早上的備份）
+        std::fs::write(root.join("transactions.json"), "BROKEN").unwrap();
+        daily_backup(&root, "2026-09-20").await.unwrap();
+        assert_eq!(std::fs::read_to_string(d.join("transactions.json")).unwrap(), "[]");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn plan_budget_updates_ignores_integer_vs_float_amounts() {
+        let mut acc_map = HashMap::new();
+        acc_map.insert("fb".to_string(), ("富邦 台幣現金".to_string(), "TWD".to_string()));
+        let budget = vec![serde_json::json!({ "id": "x1", "account_id": "fb", "type": "expense",
+            "amount": 2456, "date": "2026-06-02", "category": "轉帳", "note": "國泰信用卡", "currency": "TWD" })];
+        let want = build_cash_tx(&budget[0], &acc_map["fb"], note_of(&budget[0]));
+        // 舊版存檔：數字是整數
+        let mut stored: serde_json::Value = serde_json::from_str(&want.to_string().replace("2456.0", "2456")).unwrap();
+        stored["amount"] = serde_json::json!(2456);
+        let synced: std::collections::HashSet<String> = ["x1".to_string()].into_iter().collect();
+        assert!(plan_budget_updates(&budget, &acc_map, &synced, &[stored]).is_empty());
+        assert!(json_same(&serde_json::json!({"a": [1, 2.5]}), &serde_json::json!({"a": [1.0, 2.5]})));
+        assert!(!json_same(&serde_json::json!({"a": 1}), &serde_json::json!({"a": 2})));
     }
 }
