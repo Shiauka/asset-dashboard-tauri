@@ -10,7 +10,7 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.8.0 | [asset-dashboard_0.8.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.8.0/asset-dashboard_0.8.0_x64-setup.exe) |
+| Windows 10 / 11 | v0.8.1 | [asset-dashboard_0.8.1_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.8.1/asset-dashboard_0.8.1_x64-setup.exe) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
