@@ -27,3 +27,8 @@ desktop.ini
 .idea/
 *.suo
 *.user
+
+# Claude Code internal config
+CLAUDE.md
+AGENTS.md
+.claude/
