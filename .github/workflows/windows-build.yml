@@ -1,0 +1,41 @@
+name: Windows 安裝檔
+
+# 只在手動觸發時建置；產出的安裝檔放在這次執行的 Artifacts，不會自動發 Release。
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安裝相依套件
+        run: npm ci
+
+      - name: 前端測試
+        run: npx vitest run
+
+      - name: 後端測試
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: 建置 NSIS 安裝檔
+        run: npx tauri build --bundles nsis
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asset-dashboard-windows-setup
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
