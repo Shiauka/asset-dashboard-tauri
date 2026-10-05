@@ -346,15 +346,47 @@ function computeTWRImpl(
   }
 
   const cfMap: Record<string, number> = {}
+  // 交易「實際進到看板」的日期：看板存檔當下就把交易套到現況（未來日期也是）→ 取交易日與記錄日較早的那個。
+  // 跟後端績效自我檢查（lib.rs effective_date）同一套規則
+  const effectiveDate = (tx: Transaction): string => {
+    let rec = tx.recorded_at
+    if (!rec && /^\d{13}$/.test(tx.id)) rec = new Date(Number(tx.id) + 8 * 3600_000).toISOString().slice(0, 10)
+    return rec && rec < tx.date ? rec : tx.date
+  }
+  // 新增現金帳戶（帶期初金額）、新增持倉：是「把原本就有的錢開始記進來」，不是賺來的 → 跟 cash_in 一樣當成流入。
+  // 但要掛在它「第一次出現在快照上」的那天：補登過去日期時，回填不會在歷史快照建出新帳戶／新持倉，
+  // 錢是到記錄當天才出現在快照上（掛在交易日會讓那段報酬變成 −100%）
+  const shows = (s: DailySnapshot, key: string) => key in (s.holdings_twd ?? {}) || key in (s.holdings_shares ?? {})
+  const newMoneyTarget = (tx: Transaction): string | undefined => {
+    const key = tx.type === 'new_position' ? tx.symbol : tx.bank
+    if (!key) return undefined
+    const idx = sorted.findIndex(s => s.date >= effectiveDate(tx))
+    if (idx < 0) return undefined
+    const j = sorted.findIndex((s, i) => i >= idx && shows(s, key))
+    if (j < 0) return undefined
+    // 帳戶早就存在（第一次出現的那張的前一張就有）：前端的 new_cash_account 什麼都不做，不是新的錢。
+    // 要在「出現的那張」判斷，不是交易日之前：刪掉後用同名補登、日期填在刪除前，仍是新的錢
+    if (tx.type === 'new_cash_account' && j > 0 && shows(sorted[j - 1], key)) return undefined
+    return sorted[j].date
+  }
   for (const tx of transactions) {
-    if (tx.type !== 'cash_in' && tx.type !== 'cash_out') continue
-    const target = snapDates.find(d => d >= tx.date)
+    const isNew = tx.type === 'new_cash_account' || tx.type === 'new_position'
+    if (tx.type !== 'cash_in' && tx.type !== 'cash_out' && !isNew) continue
+    const target = isNew ? newMoneyTarget(tx) : snapDates.find(d => d >= effectiveDate(tx))
     if (target == null) continue // flow after the last snapshot — applied once a later snapshot exists
     const txFx = fxBySnapDate[target] ?? exchangeRate
+    const native = tx.type === 'new_position' ? (tx.shares ?? 0) * (tx.price ?? 0) : tx.amount
     // budget-synced transactions may lack currency; default to TWD
-    const twd = (tx.currency ?? 'TWD') === 'TWD' ? tx.amount : tx.amount * txFx
-    const sign = tx.type === 'cash_in' ? 1 : -1
+    const twd = (tx.currency ?? 'TWD') === 'TWD' ? native : native * txFx
+    const sign = tx.type === 'cash_out' ? -1 : 1
     cfMap[target] = (cfMap[target] ?? 0) + sign * twd
+  }
+
+  // 找不到對應交易的變動（帳戶帶餘額消失、歷史被改…）不算賺賠：當成資金進出排除（報酬率與損益金額都是），
+  // 績效頁另外標出。第一張快照之前沒有區間，不適用
+  for (let i = 1; i < sorted.length; i++) {
+    const u = (sorted[i].unexplained ?? []).reduce((sum, x) => sum + x.twd, 0)
+    if (u !== 0) cfMap[sorted[i].date] = (cfMap[sorted[i].date] ?? 0) + u
   }
 
   // Build NAV series (starts at 100) and chain HPRs

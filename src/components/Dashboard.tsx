@@ -9,12 +9,12 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, ReferenceLine,
 } from 'recharts'
 import { invoke } from '@tauri-apps/api/core'
-import { loadState, saveState, resetState, clearState, isFirstRun, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot } from '@/lib/store'
+import { loadState, saveState, resetState, clearState, isFirstRun, applyTransaction, updateRetirement, reverseTransaction, retroactivelyAdjustSnapshots, editTransaction, updateHoldingPrice, updateExchangeRate, addSnapshot, setSnapshotUnexplained } from '@/lib/store'
 import { getTaiwanToday } from '@/lib/dateUtils'
 import { totalAssetsTwd, assetsByCurrency, categorySummaries, rebalanceRows, categoryDrillDown, requiredAnnualReturn, totalTargetPct, getCategories, emergencyFundTwd, investableTotalTwd } from '@/lib/calc'
 import { INITIAL_STATE } from '@/lib/initialData'
 import { DEMO_STATE } from '@/lib/demoData'
-import type { AppState, Transaction, TxType, Category, RetirementSettings } from '@/lib/types'
+import type { AppState, Transaction, TxType, Category, RetirementSettings, UnexplainedChange } from '@/lib/types'
 import TransactionDialog from './TransactionDialog'
 import RetirementDialog from './RetirementDialog'
 import PriceUpdateDialog from './PriceUpdateDialog'
@@ -130,7 +130,7 @@ export default function Dashboard() {
     ok?: boolean; code?: string; error?: string; state?: AppState; date?: string
     brokenFiles?: string[]; recoveredFiles?: string[]; warnings?: string[]
     cashMismatches?: { bank: string; dashboard: number; ledger: number }[]
-    writeBlocked?: boolean; rev?: string; hasDailyBackup?: boolean; dailyBackups?: string[]
+    writeBlocked?: boolean; versionBlocked?: string | null; rev?: string; hasDailyBackup?: boolean; dailyBackups?: string[]
   }
 
   // 讀根目錄：設定寫入保護、提醒、版本；回傳載入的 state（沒有可用資料時為 null）
@@ -138,9 +138,12 @@ export default function Dashboard() {
     const body = await enqueue(() => invoke<LoadBody>('load_snapshots'))
     revRef.current = body.rev ?? null
     emptyFolderRef.current = body.code === 'EMPTY'
-    setDailyBackups(body.dailyBackups ?? [])
-    setRestoreDate((body.dailyBackups ?? []).slice(-1)[0] ?? '')
-    if (body.brokenFiles?.length)
+    // 被較新版用過的資料夾：只能看，也不提供「從每日備份還原」（那也是寫入）
+    setDailyBackups(body.versionBlocked ? [] : body.dailyBackups ?? [])
+    setRestoreDate(body.versionBlocked ? '' : (body.dailyBackups ?? []).slice(-1)[0] ?? '')
+    if (body.versionBlocked)
+      block(body.versionBlocked)
+    else if (body.brokenFiles?.length)
       block(`以下資料檔損毀或讀不到，為保護資料已停止所有儲存：${body.brokenFiles.join('、')}。\n處理方式：先確認檔案沒有被其他程式（雲端硬碟同步、防毒）佔用後按「重新載入」；若檔案真的壞了，${body.hasDailyBackup
         ? '按下方「從每日備份還原」（交易與快照會整組回到那一天，現在的檔案會先保留在 backup\\corrupt\\）'
         : '請從你自己的備份（例如雲端硬碟的「版本記錄」、外接硬碟）把整個資料夾還原到同一個時間點——交易檔與快照檔要是同一時間的，只換其中一個會讓資料對不上（這個資料夾還沒有自動備份）'}。`)
@@ -162,7 +165,7 @@ export default function Dashboard() {
     return { loaded: body.ok && body.state ? toAppState(body.state) : null, body }
   }, [enqueue, block])
 
-  type SaveResult = { ok: boolean; rev?: string; warnings?: string[]; changed?: boolean; state?: AppState; snapshots?: AppState['snapshots'] }
+  type SaveResult = { ok: boolean; date?: string; rev?: string; warnings?: string[]; changed?: boolean; state?: AppState; snapshots?: AppState['snapshots']; todayUnexplained?: UnexplainedChange[] | null }
   type Change = (s: AppState) => { next: AppState; retro: RetroOp[] }
 
   // 寫進資料夾（只在這裡呼叫 save_snapshot）：
@@ -190,6 +193,7 @@ export default function Dashboard() {
       r.warnings?.forEach(notify)
       let saved = r.state ? toAppState(r.state) : next
       if (r.snapshots) saved = { ...saved, snapshots: r.snapshots }
+      if (r.date) saved = setSnapshotUnexplained(saved, r.date, r.todayUnexplained ?? undefined)
       // 使用者操作：存下的就是畫面（操作期間畫面鎖住，不會有別的變更）。
       // 背景存檔：存檔期間畫面若被改過，就不覆蓋（那次修改會自己再存一次）。
       if (stateRef.current === base || (change && !background)) {
@@ -471,6 +475,24 @@ ${detail}`)) return
     }
     if (updates.date !== undefined && !isValidDate(updates.date)) {
       alert(`日期格式不正確：「${updates.date}」。請輸入像 2026-09-30 這樣的日期。`); return
+    }
+    if (cur && (cur.type === 'new_cash_account' || cur.type === 'new_position')) {
+      const changed = (Object.keys(updates) as (keyof Transaction)[])
+        .some(k => {
+          if (k === 'note' || updates[k] === undefined) return false
+          const a = updates[k], b = cur[k]
+          return typeof a === 'number' && typeof b === 'number' ? Math.abs(a - b) > 1e-9 : a !== b
+        })
+      if (changed) {
+        alert('「建立現金」「建立股票」的紀錄只能修改備註。\n\n要調整金額或股數，請另外記一筆買進／賣出或現金存入／提出；直接改這筆會把之後所有交易對它的影響蓋掉。')
+        return
+      }
+      // 只改備註：不動持倉與歷史
+      await commitAfterSave(base => {
+        const result = editTransaction(base, id, { note: updates.note })
+        return { next: result ? result.next : base, retro: [] }
+      })
+      return
     }
     await commitAfterSave(base => {
       const result = editTransaction(base, id, updates)

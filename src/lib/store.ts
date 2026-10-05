@@ -1,5 +1,5 @@
 import { INITIAL_STATE } from './initialData'
-import type { AppState, Holding, CashAccount, Transaction, Category, CategoryDef, RetirementSettings } from './types'
+import type { AppState, Holding, CashAccount, Transaction, Category, CategoryDef, RetirementSettings, UnexplainedChange } from './types'
 import { getTaiwanToday } from './dateUtils'
 import { categorySummaries, holdingValueTwd, DEFAULT_CATEGORIES, getCategories } from './calc'
 
@@ -486,6 +486,17 @@ export function retroactivelyAdjustSnapshots(
   return { ...state, snapshots: updatedSnapshots }
 }
 
+// 後端存檔後回傳的「今天這張」自我檢查結果，覆蓋到畫面上的快照（沒有問題時清掉舊標記）
+export function setSnapshotUnexplained(state: AppState, date: string, unexplained: UnexplainedChange[] | undefined): AppState {
+  const snaps = state.snapshots ?? []
+  const i = snaps.findIndex(s => s.date === date)
+  if (i < 0) return state
+  const { unexplained: _old, ...rest } = snaps[i]
+  const next = [...snaps]
+  next[i] = unexplained?.length ? { ...rest, unexplained } : rest
+  return { ...state, snapshots: next }
+}
+
 export function addSnapshot(state: AppState, total_twd: number): AppState {
   const date = getTaiwanToday()
 
@@ -505,8 +516,10 @@ export function addSnapshot(state: AppState, total_twd: number): AppState {
     holdings_twd[c.bank] = c.currency === 'USD' ? c.amount * fx : c.amount
   }
 
-  const snapshot = { date, total_twd, bucket_pct, holdings_twd, holdings_shares, exchange_rate: state.exchange_rate }
   const existing = state.snapshots ?? []
+  // 今天這張若已帶有後端算的「找不到對應交易的變動」，重算數字時保留（下次載入／歷史改動時後端會重算）
+  const unexplained = existing.find(s => s.date === date)?.unexplained
+  const snapshot = { date, total_twd, bucket_pct, holdings_twd, holdings_shares, exchange_rate: state.exchange_rate, ...(unexplained ? { unexplained } : {}) }
   const filtered = existing.filter(s => s.date !== date)
   const sorted = [...filtered, snapshot].sort((a, b) => a.date.localeCompare(b.date))
   return { ...state, snapshots: sorted }
@@ -527,7 +540,14 @@ export function editTransaction(
 ): { next: AppState; oldTx: Transaction; newTx: Transaction } | null {
   const oldTx = state.transactions.find(t => t.id === id)
   if (!oldTx) return null
-  const newTx: Transaction = { ...oldTx, ...updates }
+  // 建立帳戶／建立股票：只能改備註。重新套用會把帳戶整個移掉再用期初金額重建（股票同理），
+  // 之後所有交易對它的影響都會消失（第三輪審查 P14，v0.8.1 以前就有）
+  if (oldTx.type === 'new_cash_account' || oldTx.type === 'new_position') {
+    const newTx: Transaction = { ...oldTx, note: 'note' in updates ? updates.note : oldTx.note }
+    return { next: { ...state, transactions: state.transactions.map(t => t.id === id ? newTx : t) }, oldTx, newTx }
+  }
+  // 記下修改的那天：改成未來日期、或從未來改回來時，績效計算要知道這筆是哪天進到看板的
+  const newTx: Transaction = { ...oldTx, ...updates, recorded_at: getTaiwanToday() }
   let next = reverseTransaction(state, id)
   next = applyTransaction(next, newTx as Parameters<typeof applyTransaction>[1])
   return { next, oldTx, newTx }

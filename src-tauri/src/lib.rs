@@ -155,6 +155,177 @@ fn enrich_snapshot(date: &str, state: &serde_json::Value) -> Option<serde_json::
     }))
 }
 
+// ── 績效自我檢查：相鄰兩張快照之間的變動，交易解釋得了嗎 ─────────────────────────
+// 2026-10-03 事件：舊版看板把一筆轉帳拆掉，一個已經刪掉的帳戶在一整個月的歷史快照裡被回沖出餘額 →
+// 帳戶刪除那天的報酬率憑空大跌，App 沒有任何提示。這裡把「找不到對應交易的變動」逐筆列出，
+// 前端標在績效頁、並當成外部進出排除在報酬率之外（不默默算成賺賠）。
+/// 換算台幣不到 1 元的差額不列（手動對帳的小數尾差；跟現金對帳同一個門檻）
+const UNEXPLAINED_MIN_TWD: f64 = 1.0;
+
+/// prev 這張快照套上 (prev, cur] 之間的交易，跟 cur 比：每個現金帳戶／持倉的差額就是「找不到交易」的變動
+fn unexplained_changes(prev: &serde_json::Value, cur: &serde_json::Value, window: &[&serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut exp = prev.clone();
+    // cur 才出現的帳戶／持倉先補 0：交易若有動到它就會被算進去，沒有就是「帶著餘額憑空出現」
+    for c in cur["cash_accounts"].as_array().cloned().unwrap_or_default() {
+        if let Some(b) = c["bank"].as_str() {
+            if !bank_exists(&exp, b) {
+                if let Some(arr) = exp["cash_accounts"].as_array_mut() {
+                    arr.push(serde_json::json!({ "bank": b, "amount": 0.0, "currency": c["currency"].clone() }));
+                }
+            }
+        }
+    }
+    for h in cur["holdings"].as_array().cloned().unwrap_or_default() {
+        if let Some(sym) = h["symbol"].as_str() {
+            let has = exp["holdings"].as_array().map_or(false, |a| a.iter().any(|x| x["symbol"].as_str() == Some(sym)));
+            if !has {
+                if let Some(arr) = exp["holdings"].as_array_mut() {
+                    arr.push(serde_json::json!({ "symbol": sym, "shares": 0.0 }));
+                }
+            }
+        }
+    }
+    for tx in window {
+        if tx["type"].as_str() == Some("new_cash_account") {
+            // 新增現金帳戶時帶的期初金額（前端 applyTransaction 的語意：帳戶已經存在就什麼都不做）
+            if let (Some(b), Some(a)) = (tx["bank"].as_str(), tx["amount"].as_f64()) {
+                if bank_exists(prev, b) { continue; }
+                if let Some(c) = exp["cash_accounts"].as_array_mut().and_then(|arr| arr.iter_mut().find(|c| c["bank"].as_str() == Some(b))) {
+                    c["amount"] = serde_json::json!(c["amount"].as_f64().unwrap_or(0.0) + a);
+                }
+            }
+            continue;
+        }
+        apply_delta(&mut exp, tx, 1.0);
+    }
+    let fx = cur["exchange_rate"].as_f64().filter(|r| *r > 0.0)
+        .or_else(|| prev["exchange_rate"].as_f64()).unwrap_or(1.0);
+    let mut out = Vec::new();
+    let cash_of = |s: &serde_json::Value, b: &str| -> Option<(f64, String)> {
+        s["cash_accounts"].as_array()?.iter().find(|c| c["bank"].as_str() == Some(b))
+            .map(|c| (c["amount"].as_f64().unwrap_or(0.0), c["currency"].as_str().unwrap_or("TWD").to_string()))
+    };
+    let mut banks: Vec<String> = Vec::new();
+    for s in [&exp, cur] {
+        for c in s["cash_accounts"].as_array().cloned().unwrap_or_default() {
+            if let Some(b) = c["bank"].as_str() { if !banks.iter().any(|x| x == b) { banks.push(b.to_string()); } }
+        }
+    }
+    for b in banks {
+        let e = cash_of(&exp, &b);
+        let a = cash_of(cur, &b);
+        let currency = a.as_ref().or(e.as_ref()).map(|x| x.1.clone()).unwrap_or_else(|| "TWD".into());
+        let diff = a.map_or(0.0, |x| x.0) - e.map_or(0.0, |x| x.0);
+        let twd = if currency == "USD" { diff * fx } else { diff };
+        if twd.abs() > UNEXPLAINED_MIN_TWD {
+            out.push(serde_json::json!({ "kind": "cash", "name": b, "delta": diff, "currency": currency, "twd": twd }));
+        }
+    }
+    let hold_of = |s: &serde_json::Value, sym: &str| -> Option<serde_json::Value> {
+        s["holdings"].as_array()?.iter().find(|h| h["symbol"].as_str() == Some(sym)).cloned()
+    };
+    let mut syms: Vec<String> = Vec::new();
+    for s in [&exp, cur] {
+        for h in s["holdings"].as_array().cloned().unwrap_or_default() {
+            if let Some(x) = h["symbol"].as_str() { if !syms.iter().any(|y| y == x) { syms.push(x.to_string()); } }
+        }
+    }
+    for sym in syms {
+        let e = hold_of(&exp, &sym);
+        let a = hold_of(cur, &sym);
+        let sh = |h: &Option<serde_json::Value>| h.as_ref().and_then(|h| h["shares"].as_f64()).unwrap_or(0.0);
+        let diff = sh(&a) - sh(&e);
+        // 估值用有資料的那一邊（消失的持倉用前一天的價格）
+        let info = a.clone().filter(|h| h["price"].is_number()).or_else(|| hold_of(prev, &sym)).unwrap_or(serde_json::Value::Null);
+        let price = info["price"].as_f64().unwrap_or(0.0);
+        let usd = info["currency"].as_str() == Some("USD");
+        let twd = diff * price * if usd { fx } else { 1.0 };
+        // 股數有差但查不到價格（估不出金額）也要列出，不能因為金額是 0 就放過
+        if diff.abs() > 1e-6 && (twd.abs() > UNEXPLAINED_MIN_TWD || price <= 0.0) {
+            out.push(serde_json::json!({ "kind": "holding", "name": sym, "delta": diff,
+                "currency": if usd { "USD" } else { "TWD" }, "twd": twd }));
+        }
+    }
+    out
+}
+
+/// 走勢／績效用的快照序列：每張附上與前一張之間「找不到對應交易」的變動（unexplained）
+/// 毫秒時間戳 → 台灣日期 YYYY-MM-DD
+fn taiwan_date_of_ms(ms: i64) -> String {
+    let days = (ms / 1000 + 8 * 3600).div_euclid(86_400);
+    // Howard Hinnant 的 civil_from_days
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// 交易「實際進到看板」的日期。看板手動記的交易，前端存檔當下就套到現況，
+/// 未來日期的交易也一樣（id 是建立時的毫秒時間戳）→ 取「交易日」與「記錄日」較早的那個
+fn effective_date(tx: &serde_json::Value) -> String {
+    let date = tx["date"].as_str().unwrap_or("").to_string();
+    match recorded_date(tx) { Some(r) if r < date => r, _ => date }
+}
+
+/// 看板手動交易最後一次記錄／修改的那天：前端修改交易時會寫 recorded_at；沒有就是建立那天
+fn recorded_date(tx: &serde_json::Value) -> Option<String> {
+    if let Some(r) = tx["recorded_at"].as_str().filter(|r| storage::is_date_name(r)) { return Some(r.to_string()); }
+    created_date(tx)
+}
+
+/// 看板手動交易建立的那天（id 是建立當下的毫秒時間戳；帳務管家同步來的沒有）。修改不會變
+fn created_date(tx: &serde_json::Value) -> Option<String> {
+    tx["id"].as_str()
+        .filter(|id| id.len() == 13 && id.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|id| id.parse::<i64>().ok())
+        .map(taiwan_date_of_ms)
+}
+
+fn snapshot_series(entries: &[(String, serde_json::Value)], txs: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut dated: Vec<(String, &serde_json::Value)> = txs.iter().filter(|t| t["date"].is_string())
+        .map(|t| (effective_date(t), t)).collect();
+    dated.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = Vec::new();
+    let mut prev: Option<(&str, &serde_json::Value)> = None;
+    for (d, s) in entries {
+        let Some(mut snap) = enrich_snapshot(d, s) else { continue };
+        if let Some((pd, ps)) = prev {
+            let mut window: Vec<&serde_json::Value> = dated.iter()
+                .filter(|(td, _)| td.as_str() > pd && td.as_str() <= d.as_str()).map(|(_, t)| *t)
+                .collect();
+            // 補登過去日期的「建立帳戶／建立持倉」：回填不會在歷史快照裡建出新帳戶，所以它第一次出現的那張快照，
+            // 要把那筆建立交易算進來（交易日在比對區間之前）
+            for (td, t) in &dated {
+                if td.as_str() > pd { break; }
+                // 只認這段期間才記下的補登；很久以前那筆舊的建立交易（之後刪掉、又用同名重建）不算
+                // 看「建立日」不看「最後修改日」：補登之後再改備註／股數，它出現在快照上的日子不會變
+                if created_date(t).map_or(true, |r| r.as_str() <= pd || r.as_str() > d.as_str()) { continue; }
+                let appears = match t["type"].as_str() {
+                    Some("new_cash_account") => t["bank"].as_str().map_or(false, |b| !bank_exists(ps, b) && bank_exists(s, b)),
+                    Some("new_position") => t["symbol"].as_str().map_or(false, |sym| {
+                        let has = |st: &serde_json::Value| st["holdings"].as_array().map_or(false, |a| a.iter().any(|h| h["symbol"].as_str() == Some(sym)));
+                        !has(ps) && has(s)
+                    }),
+                    _ => false,
+                };
+                if appears { window.push(t); }
+            }
+            let mut issues = unexplained_changes(ps, s, &window);
+            for i in issues.iter_mut() { i["from"] = serde_json::json!(pd); }
+            if !issues.is_empty() { snap["unexplained"] = serde_json::json!(issues); }
+        }
+        prev = Some((d.as_str(), s));
+        out.push(snap);
+    }
+    out
+}
+
 fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64) {
     let ty = tx["type"].as_str().unwrap_or("");
     let symbol = tx["symbol"].as_str();
@@ -278,13 +449,43 @@ fn apply_delta(state: &mut serde_json::Value, tx: &serde_json::Value, sign: f64)
 // the flow (the snapshot's cash balance hadn't dropped yet, but cfMap already excluded
 // it) and produced a fake NAV spike followed by a fake crash once a later snapshot
 // finally synced the real balance.
+/// 目前看板上的現金帳戶（今天的狀態）
+fn live_banks(state: &serde_json::Value) -> std::collections::HashSet<String> {
+    state["cash_accounts"].as_array().map_or_else(Default::default, |a| {
+        a.iter().filter_map(|c| c["bank"].as_str().map(String::from)).collect()
+    })
+}
+
+/// 回填歷史時可以動的帳戶：畫面送來的狀態「和」磁碟上最新一張快照都還有的帳戶。
+/// 只看畫面狀態的話，舊視窗的畫面裡還留著另一個視窗已經刪掉的帳戶，會讓它的歷史又被改（故障矩陣 S6/S7）
+async fn live_banks_checked(cache: &mut MonthCache, state: &serde_json::Value) -> Result<std::collections::HashSet<String>, String> {
+    let mut live = live_banks(state);
+    if let Some(last) = storage::list_month_files(&cache.root.join("snapshots")).await?.last() {
+        if let Some((_, st)) = cache.load(last).await?.iter().next_back() {
+            let disk = live_banks(st);
+            live.retain(|b| disk.contains(b));
+        }
+    }
+    Ok(live)
+}
+
 /// 把一筆日期早於今天的交易回填到 [tx.date, today) 之間所有已存在的快照（只改記憶體快取）。
+/// 已經從看板刪掉的帳戶（live 裡沒有）歷史一律不動：刪掉的帳戶不能因為回填而「復活」或改變餘額
+/// （2026-10-03：已刪的帳戶在一整個月的快照裡被回沖出餘額，報酬率憑空大跌）。
 async fn retro_patch(
     cache: &mut MonthCache,
     tx: &serde_json::Value,
     sign: f64,
     today: &str,
+    live: &std::collections::HashSet<String>,
 ) -> Result<Vec<String>, String> {
+    let mut tx = tx.clone();
+    for f in ["bank", "bank_to"] {
+        if let Some(b) = tx[f].as_str() {
+            if b != "__none" && !live.contains(b) { tx[f] = serde_json::Value::Null; }
+        }
+    }
+    let tx = &tx;
     let tx_date = tx["date"].as_str().unwrap_or("").to_string();
     if tx_date.is_empty() || tx_date.as_str() >= today {
         return Ok(Vec::new());
@@ -469,6 +670,79 @@ fn resolve_transfer_group(
         // 兩側都不對應 → 跳過
         _ => None,
     }
+}
+
+/// 帳務管家帳戶的顯示名稱（名稱＋備註，例如「國泰 儲蓄險」）；找不到就回傳帳戶 id
+fn budget_account_name(meta: &serde_json::Value, id: &str) -> String {
+    meta["accounts"].as_array().and_then(|a| a.iter().find(|x| x["id"].as_str() == Some(id)))
+        .map(|a| {
+            let name = a["name"].as_str().unwrap_or(id);
+            let base = match a["note"].as_str().filter(|n| !n.is_empty()) { Some(n) => format!("{} {}", name, n), None => name.to_string() };
+            // 帳務管家可能有好幾個同名帳戶：附上它對應的看板帳戶才分得出來
+            match a["dashboard_bank_name"].as_str().filter(|b| !b.is_empty()) {
+                Some(b) => format!("{}（對應看板「{}」）", base, b),
+                None => base,
+            }
+        })
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn fmt_amount(v: &serde_json::Value) -> String {
+    let x = v.as_f64().unwrap_or(0.0);
+    let s = format!("{:.2}", x.abs());
+    let (int, frac) = s.split_once('.').unwrap();
+    let mut out = String::new();
+    for (i, c) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 { out.push(','); }
+        out.push(c);
+    }
+    let frac = frac.trim_end_matches('0');
+    format!("{}{}{}", if x < 0.0 { "-" } else { "" }, out, if frac.is_empty() { String::new() } else { format!(".{}", frac) })
+}
+
+/// 看板交易的「內容」欄位（不含 id、currency 這類格式欄位）是否相同
+fn semantic_same(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    // 舊版（v0.5.3 以前）同步的轉帳沒有 amount_to：當時兩邊金額相同，等於 amount
+    let amount_to = |t: &serde_json::Value| if t["type"] == "transfer" && t["amount_to"].is_null() { t["amount"].clone() } else { t["amount_to"].clone() };
+    json_same(&amount_to(a), &amount_to(b))
+        && ["type", "date", "amount", "bank", "bank_to", "note"].iter().all(|f| json_same(&a[*f], &b[*f]))
+}
+
+/// 這筆已同步的看板紀錄，背後的帳務管家交易內容跟當初同步時一樣嗎？
+/// 看板紀錄本身就記著同步當下的內容（金額、日期、備註、對應的看板帳戶），逐欄比對即可，不需要另外存指紋。
+/// 回傳 (還在帳務管家裡的來源筆數, 來源總筆數, 還在的來源是否全部跟紀錄一致)
+fn synced_sources_unchanged(
+    k: &serde_json::Value,
+    budget_by_id: &HashMap<&str, &serde_json::Value>,
+    acc_map: &HashMap<String, (String, String)>,
+) -> (usize, usize, bool) {
+    let num = |a: &serde_json::Value, b: &serde_json::Value| json_same(a, b);
+    let bank_is = |t: &serde_json::Value, want: &serde_json::Value| {
+        bank_of(t, acc_map).map(|(b, _)| b).as_deref() == want.as_str()
+    };
+    if let Some(pair) = k["budget_tx_id_pair"].as_str() {
+        let e = k["budget_tx_id"].as_str().and_then(|id| budget_by_id.get(id)).copied();
+        let i = budget_by_id.get(pair).copied();
+        let e_ok = e.map(|e| e["type"] == "expense" && num(&e["amount"], &k["amount"]) && e["date"] == k["date"]
+            && json_same(&note_of(e), &k["note"]) && bank_is(e, &k["bank"]));
+        let amount_to = if k["amount_to"].is_null() { &k["amount"] } else { &k["amount_to"] };
+        let i_ok = i.map(|i| i["type"] == "income" && num(&i["amount"], amount_to) && i["date"] == k["date"]
+            && bank_is(i, &k["bank_to"]));
+        let same_group = match (e, i) {
+            (Some(e), Some(i)) => !e["transfer_id"].is_null() && e["transfer_id"] == i["transfer_id"],
+            _ => true,
+        };
+        let present = e.is_some() as usize + i.is_some() as usize;
+        return (present, 2, same_group && e_ok.unwrap_or(true) && i_ok.unwrap_or(true));
+    }
+    let Some(x) = k["budget_tx_id"].as_str().and_then(|id| budget_by_id.get(id)).copied() else { return (0, 1, false) };
+    let ok = bank_of(x, acc_map).map_or(false, |bc| semantic_same(&build_cash_tx(x, &bc, note_of(x)), k));
+    // 看板上是單筆、帳務管家那邊其實是轉帳的一邊：當初另一邊的帳戶沒對應看板。
+    // 現在另一邊對應上了（使用者把帳戶對應到看板），單筆變成轉帳是正常的 → 算「有變」，照常同步
+    let partner_mapped = x["transfer_id"].as_str().filter(|t| !t.is_empty()).map_or(false, |tid| {
+        budget_by_id.values().any(|t| t["transfer_id"].as_str() == Some(tid) && t["id"] != x["id"] && bank_of(t, acc_map).is_some())
+    });
+    (1, 1, ok && !partner_mapped)
 }
 
 /// 規劃要新增到看板的交易（尚未同步過的候選交易）。
@@ -811,6 +1085,9 @@ async fn sync_budget_into_state(
     let any_pair: HashSet<String> = dash_txs.iter().chain(disk_txs.iter())
         .filter_map(|t| t["budget_tx_id_pair"].as_str().map(String::from)).collect();
     let keys: BTreeSet<String> = d_map.keys().chain(s_map.keys()).chain(k_map.keys()).cloned().collect();
+    let live = live_banks_checked(cache, merged).await?;
+    let budget_by_id: std::collections::HashMap<&str, &serde_json::Value> = budget.txs.iter()
+        .filter_map(|t| Some((t["id"].as_str()?, t))).collect();
     let mut skipped_missing_month = 0usize;
     let mut removed_today = 0usize;
     let mut unmapped: BTreeSet<String> = BTreeSet::new();
@@ -875,6 +1152,32 @@ async fn sync_budget_into_state(
                 continue; // 對應不到帳戶：這筆整個不動（不標記、不回填），補建帳戶後自動同步
             }
         }
+        // 鐵則：帳務管家那邊內容沒變的已同步交易，看板不得改它、也不得回填它的歷史。
+        // 違反就是同步邏輯或資料出了問題（例如轉帳只剩一邊）→ 整次同步中止、不寫檔、告訴使用者
+        let same_k = match (kd, d) { (Some(a), Some(b)) => json_same(a, b), (None, None) => true, _ => false };
+        if let (Some(old), false) = (kd, same_k) {
+            let (present, total, unchanged) = synced_sources_unchanged(old, &budget_by_id, &acc_map);
+            let format_only = d.map_or(false, |n| semantic_same(n, old));
+            if present > 0 && unchanged && !format_only {
+                let what = old["note"].as_str().map(String::from)
+                    .unwrap_or_else(|| old["type"].as_str().unwrap_or("").to_string());
+                let head = format!("帳務管家裡 {} 的「{}」（金額 {}）", old["date"].as_str().unwrap_or(""), what, fmt_amount(&old["amount"]));
+                return Err(if present < total {
+                    // 轉帳只剩一邊：告訴使用者剩下哪一筆、怎麼處理
+                    let left = ["budget_tx_id", "budget_tx_id_pair"].iter()
+                        .filter_map(|f| old[*f].as_str()).find_map(|id| budget_by_id.get(id).copied());
+                    let left_acc = left.map(|t| budget_account_name(&budget.meta, t["account_id"].as_str().unwrap_or(""))).unwrap_or_default();
+                    format!("{}是一筆轉帳，但現在只剩「{}」那一邊，另一邊不見了（常見原因：帳戶連同它的交易一起被刪掉）。\
+                        如果直接同步，看板會把這筆轉帳拆成單邊、改寫過去的餘額，所以這次先暫停同步帳務管家的資料，看板上的數字都沒有動。\
+                        處理方式：在帳務管家把這筆轉帳補完整（例如從備份還原那個帳戶），或確定不要了就把剩下「{}」那一筆也刪掉；處理好後重新開啟看板即可恢復同步",
+                        head, left_acc, left_acc)
+                } else {
+                    format!("{}內容沒有改過，但這次同步卻會改動看板上的這筆紀錄和它過去的餘額，這不應該發生。\
+                        為保護資料，這次先暫停同步帳務管家的資料，看板上的數字都沒有動。請確認帳務管家和看板都是最新版；問題持續的話請回報",
+                        head)
+                });
+            }
+        }
         // 今天：畫面狀態 S → D
         let same_s = match (s, d) { (Some(a), Some(b)) => json_same(a, b), (None, None) => true, _ => false };
         if !same_s {
@@ -890,10 +1193,9 @@ async fn sync_budget_into_state(
             out.changed = true;
         }
         // 歷史：磁碟 K → D
-        let same_k = match (kd, d) { (Some(a), Some(b)) => json_same(a, b), (None, None) => true, _ => false };
         if !same_k {
-            if let Some(old) = kd { retro_patch(cache, old, -1.0, today).await?; }
-            if let Some(new) = d { retro_patch(cache, new, 1.0, today).await?; }
+            if let Some(old) = kd { retro_patch(cache, old, -1.0, today, &live).await?; }
+            if let Some(new) = d { retro_patch(cache, new, 1.0, today, &live).await?; }
             out.changed = true;
         }
     }
@@ -1122,6 +1424,11 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
 
     // 上次未完成的寫入先補完
     let mut broken: Vec<String> = Vec::new();
+    // 資料夾被更新的版本用過：只讀，什麼都不寫（含補完日誌、轉換舊檔、每日備份、同步）
+    let version_blocked = storage::newer_data_version(&root).await.map(|v| storage::newer_version_message(&v));
+    if let Some(msg) = &version_blocked {
+        broken.push(msg.clone());
+    } else {
     match storage::recover_journal(&root).await {
         Ok(true) => warnings.push("上次關閉前有一筆寫入沒完成，已自動補完".into()),
         Ok(false) => {}
@@ -1134,6 +1441,7 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
             "舊版每日檔有 {} 個無法讀取，未轉入（原檔保留）：{}", failed.len(), failed.join("、"))),
         Ok(_) => {}
         Err(e) => warnings.push(format!("舊版資料轉換失敗：{}", e)),
+    }
     }
 
     let snap_dir = root.join("snapshots");
@@ -1274,8 +1582,7 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
     if merged.get("transactions").is_none() {
         if let Some(t) = &transactions { merged["transactions"] = t.clone(); }
     }
-    let snaps: Vec<serde_json::Value> = all_entries.iter()
-        .filter_map(|(d, s)| enrich_snapshot(d, s)).collect();
+    let snaps = snapshot_series(&all_entries, merged["transactions"].as_array().map_or(&[][..], |v| v.as_slice()));
     let dates: Vec<String> = all_entries.iter().map(|(d, _)| d.clone()).collect();
     merged["snapshots"] = serde_json::json!(snaps);
 
@@ -1292,6 +1599,7 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
         "warnings": warnings,
         "cashMismatches": cash_mismatches,
         "writeBlocked": write_blocked,
+        "versionBlocked": version_blocked,
         "syncChanged": sync_changed,
         "syncNotes": sync_notes,
         "rev": rev,
@@ -1311,7 +1619,33 @@ async fn all_snapshots(root: &std::path::Path) -> Vec<serde_json::Value> {
         }
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries.iter().filter_map(|(d, s)| enrich_snapshot(d, s)).collect()
+    let txs = match storage::read_json::<Vec<serde_json::Value>>(&root.join("transactions.json")).await {
+        storage::FileRead::Ok(v) => v,
+        _ => Vec::new(),
+    };
+    snapshot_series(&entries, &txs)
+}
+
+/// 最後幾個月份檔的快照序列（只用來算最新一張的自我檢查）
+async fn recent_snapshots(root: &std::path::Path, months: usize) -> Vec<serde_json::Value> {
+    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Ok(files) = storage::list_month_files(&root.join("snapshots")).await {
+        for mf in files.iter().rev().take(months) {
+            if let storage::FileRead::Ok(m) = storage::read_json::<SnapMap>(&root.join("snapshots").join(mf)).await {
+                entries.extend(m.into_iter());
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let txs = match storage::read_json::<Vec<serde_json::Value>>(&root.join("transactions.json")).await {
+        storage::FileRead::Ok(v) => v,
+        _ => Vec::new(),
+    };
+    snapshot_series(&entries, &txs)
+}
+
+fn latest_unexplained(series: &[serde_json::Value], date: &str) -> serde_json::Value {
+    series.last().filter(|s| s["date"] == date).map(|s| s["unexplained"].clone()).unwrap_or(serde_json::Value::Null)
 }
 
 /// 設定根目錄前確認資料夾是否存在；create = true 時（使用者已確認）建立它
@@ -1333,6 +1667,7 @@ async fn ensure_root_dir(path: String, create: bool) -> Result<serde_json::Value
 async fn restore_daily_backup(app: AppHandle, date: String, lock: tauri::State<'_, SnapshotLock>) -> Result<(), String> {
     let _guard = lock.0.lock().await;
     let root = root_path(&app).ok_or("尚未設定根目錄")?;
+    if let Some(v) = storage::newer_data_version(&root).await { return Err(storage::newer_version_message(&v)); }
     if tokio::fs::metadata(root.join(storage::JOURNAL_FILE)).await.is_ok() {
         storage::recover_journal(&root).await?;
     }
@@ -1441,6 +1776,7 @@ async fn save_at(
     warnings.extend(o.warnings);
     // 2) 使用者這次操作的歷史回填
     let had_retro = !retro.is_empty();
+    let live = live_banks_checked(&mut cache, &state).await?;
     for op in retro {
         // 帳務管家同步來的交易，歷史一律由同步（K→D）處理；不接受前端對它的回填，否則會跟同步重複或衝突
         if op.tx["budget_tx_id"].is_string() { continue; }
@@ -1449,7 +1785,7 @@ async fn save_at(
             return Err(format!("交易日期格式不正確（{}），沒有儲存", d));
         }
         let sign = if op.direction == -1 { -1.0 } else { 1.0 };
-        retro_patch(&mut cache, &op.tx, sign, &date).await?;
+        retro_patch(&mut cache, &op.tx, sign, &date, &live).await?;
     }
     // 3) 今天的快照＋交易清單 —— 以上全部同一個 Txn
     let mf = month_file_of(&date).ok_or("日期格式錯誤")?;
@@ -1469,8 +1805,14 @@ async fn save_at(
         "ok": true, "date": date, "rev": storage::revision(&root).await, "warnings": warnings,
         "changed": o.changed, "state": state,
     });
+    // 今天這張的自我檢查結果每次存檔都更新（例如剛刪掉一個還有餘額的帳戶，要馬上標出、馬上排除在報酬率外）
     if history_changed {
-        resp["snapshots"] = serde_json::json!(all_snapshots(&root).await);
+        let series = all_snapshots(&root).await;
+        resp["todayUnexplained"] = latest_unexplained(&series, &date);
+        resp["snapshots"] = serde_json::json!(series);
+    } else {
+        // 一般存檔（報價更新、切回視窗）只需要最後兩張：只讀最後兩個月份檔
+        resp["todayUnexplained"] = latest_unexplained(&recent_snapshots(&root, 2).await, &date);
     }
     Ok(resp)
 }
@@ -1539,7 +1881,12 @@ async fn retroactive_update(
     storage::check_revision(&root, expected_rev.as_deref()).await?;
     let sign: f64 = if direction == Some(-1) { -1.0 } else { 1.0 };
     let mut cache = MonthCache::new(&root);
-    let updated = retro_patch(&mut cache, &tx, sign, &get_taiwan_date()).await?;
+    // 舊前端沒有送畫面狀態：以磁碟上最新一張快照的帳戶為準
+    let mut live = std::collections::HashSet::new();
+    if let Some(last) = storage::list_month_files(&root.join("snapshots")).await?.last() {
+        if let Some((_, st)) = cache.load(last).await?.iter().next_back() { live = live_banks(st); }
+    }
+    let updated = retro_patch(&mut cache, &tx, sign, &get_taiwan_date(), &live).await?;
     let mut txn = storage::Txn::default();
     cache.into_txn(&mut txn)?;
     txn.commit(&root).await?;
@@ -3320,6 +3667,503 @@ mod tests {
             load_at(Some(root.clone()), "2026-10-02").await.unwrap();
             println!("tmp still exists = {}", tmp.exists());
             assert!(!tmp.exists(), "超過 10 分鐘的暫存檔應被清掉");
+        }
+    }
+
+    // 2026-10-03 事件（保單結清轉帳被拆掉、已刪帳戶的歷史被回沖）的回歸測試。資料全部自己編，不用真實資料。
+    mod aia_20261003 {
+        use super::super::*;
+        use super::snapshot_of_dir;
+        fn fresh(name: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("adb_aia_{}", std::process::id())).join(name);
+            let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap(); d
+        }
+        fn st(a: Option<f64>, b: f64) -> serde_json::Value {
+            let mut cash = vec![];
+            if let Some(a) = a { cash.push(serde_json::json!({ "bank": "A", "currency": "TWD", "amount": a })); }
+            cash.push(serde_json::json!({ "bank": "B", "currency": "TWD", "amount": b }));
+            serde_json::json!({ "cash_accounts": cash, "holdings": [], "exchange_rate": 31.0 })
+        }
+        fn month(root: &std::path::Path) -> serde_json::Value {
+            serde_json::from_str(storage::strip_bom(&std::fs::read_to_string(root.join("snapshots/2026-09.json")).unwrap())).unwrap()
+        }
+        fn cash(root: &std::path::Path, d: &str, bank: &str) -> Option<f64> {
+            month(root)[d]["cash_accounts"].as_array().unwrap().iter()
+                .find(|c| c["bank"] == bank).and_then(|c| c["amount"].as_f64())
+        }
+        /// ya→A（之後結清、取消對應、封存）、yb→B
+        fn put_budget(root: &std::path::Path, a_mapped: bool, txs: serde_json::Value) {
+            let mut ya = serde_json::json!({ "id": "ya", "currency": "TWD", "initial_balance": 1000.0 });
+            if a_mapped { ya["dashboard_bank_name"] = "A".into(); } else { ya["archived"] = true.into(); }
+            std::fs::write(root.join("budget.json"), serde_json::json!({ "accounts": [ya,
+                { "id": "yb", "dashboard_bank_name": "B", "currency": "TWD", "initial_balance": 1000.0 }]}).to_string()).unwrap();
+            std::fs::create_dir_all(root.join("budget")).unwrap();
+            std::fs::write(root.join("budget/2026-09.json"), txs.to_string()).unwrap();
+        }
+        fn e1() -> serde_json::Value { serde_json::json!({ "id": "e1", "account_id": "ya", "type": "expense", "amount": 100.0, "date": "2026-09-02", "category": "轉帳", "note": "退保", "transfer_id": "T" }) }
+        fn i1() -> serde_json::Value { serde_json::json!({ "id": "i1", "account_id": "yb", "type": "income", "amount": 100.0, "date": "2026-09-02", "category": "轉帳", "note": "退保", "transfer_id": "T" }) }
+
+        /// A 的錢在 9/2 全部轉到 B（A 歸 0），之後兩邊都把 A 結清：帳務管家取消對應＋封存、看板刪掉 A
+        async fn closed_account(name: &str) -> std::path::PathBuf {
+            let root = fresh(name);
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            let mut m = serde_json::Map::new();
+            for d in ["2026-09-01", "2026-09-02", "2026-09-03"] { m.insert(d.into(), st(Some(100.0), 1000.0)); }
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            put_budget(&root, true, serde_json::json!([e1(), i1()]));
+            load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            assert_eq!((cash(&root, "2026-09-02", "A"), cash(&root, "2026-09-02", "B")), (Some(0.0), Some(1100.0)));
+            // 結清：看板刪掉 A（今天起的快照沒有 A）、帳務管家取消對應並封存
+            let mut mm = month(&root);
+            mm["2026-09-04"] = st(None, 1100.0);
+            std::fs::write(root.join("snapshots/2026-09.json"), mm.to_string()).unwrap();
+            put_budget(&root, false, serde_json::json!([e1(), i1()]));
+            let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            assert!(r["warnings"].as_array().unwrap().is_empty(), "{:?}", r["warnings"]);
+            root
+        }
+        fn has_transfer(root: &std::path::Path) -> bool {
+            let t: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("transactions.json")).unwrap()).unwrap();
+            t.as_array().unwrap().iter().any(|t| t["type"] == "transfer" && t["budget_tx_id"] == "e1")
+        }
+        fn warned(r: &serde_json::Value, s: &str) -> bool {
+            r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains(s))
+        }
+
+        // 10/3 的實際形狀：帳戶取消對應＋封存、看板帳戶已刪 → 原樣保留、不提示、反覆開啟不寫檔
+        #[tokio::test]
+        async fn closed_account_shape_is_stable() {
+            let root = closed_account("stable").await;
+            let before = snapshot_of_dir(&root);
+            for _ in 0..2 {
+                let r = load_at(Some(root.clone()), "2026-09-05").await.unwrap();
+                assert!(r["warnings"].as_array().unwrap().is_empty(), "{:?}", r["warnings"]);
+                assert_eq!(r["syncChanged"], false);
+            }
+            assert_eq!(snapshot_of_dir(&root), before);
+            assert!(has_transfer(&root));
+        }
+
+        // 舊碼會失敗：帳務管家裡只剩轉入那一邊 → v0.8.1 會把轉帳換成單邊 cash_in、把已刪的 A 在歷史裡回沖成 100，而且不提示
+        #[tokio::test]
+        async fn half_transfer_aborts_sync_and_keeps_history() {
+            let root = closed_account("half_in").await;
+            put_budget(&root, false, serde_json::json!([i1()]));
+            let before = snapshot_of_dir(&root);
+            let r = load_at(Some(root.clone()), "2026-09-05").await.unwrap();
+            assert!(warned(&r, "只剩「") && warned(&r, "暫停同步"), "{:?}", r["warnings"]);
+            assert_eq!(r["syncChanged"], false);
+            assert_eq!(snapshot_of_dir(&root), before, "同步中止：一個檔都不能改");
+            assert!(has_transfer(&root));
+            assert_eq!(cash(&root, "2026-09-02", "A"), Some(0.0), "已刪帳戶的歷史不可被回沖");
+        }
+
+        // 同上，換成轉出那一邊還在（帳戶都還對應著）
+        #[tokio::test]
+        async fn half_transfer_expense_side_left_aborts() {
+            let root = fresh("half_out");
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            let mut m = serde_json::Map::new();
+            for d in ["2026-09-01", "2026-09-02", "2026-09-03"] { m.insert(d.into(), st(Some(100.0), 1000.0)); }
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            put_budget(&root, true, serde_json::json!([e1(), i1()]));
+            load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            put_budget(&root, true, serde_json::json!([e1()]));
+            let before = snapshot_of_dir(&root);
+            let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            assert!(warned(&r, "只剩「") && warned(&r, "暫停同步"), "{:?}", r["warnings"]);
+            assert_eq!(snapshot_of_dir(&root), before);
+            assert_eq!((cash(&root, "2026-09-02", "A"), cash(&root, "2026-09-02", "B")), (Some(0.0), Some(1100.0)));
+        }
+
+        // 舊碼會失敗：整筆轉帳在帳務管家刪掉是正常操作，照常移除；但已刪的 A 的歷史不可以「復活」
+        #[tokio::test]
+        async fn full_delete_never_revives_deleted_account() {
+            let root = closed_account("full_del").await;
+            put_budget(&root, false, serde_json::json!([]));
+            // 帳務管家整個月沒有交易會被當成「資料是空的」而拒絕同步；放一筆無關的交易
+            put_budget(&root, false, serde_json::json!([{ "id": "x", "account_id": "yb", "type": "expense", "amount": 0.0, "date": "2026-09-01", "category": "x" }]));
+            let r = load_at(Some(root.clone()), "2026-09-05").await.unwrap();
+            assert!(!has_transfer(&root), "{:?}", r["warnings"]);
+            assert_eq!(cash(&root, "2026-09-02", "B"), Some(1000.0), "還在的 B 照常回沖");
+            assert_eq!(cash(&root, "2026-09-02", "A"), Some(0.0), "已刪的 A 不可被改");
+            // 錢憑空從 A 消失（9/1 有 100、9/2 歸 0 卻沒有交易）→ 績效自我檢查要標出來
+            let flagged = r["state"]["snapshots"].as_array().unwrap().iter()
+                .any(|s| s["date"] == "2026-09-02" && s["unexplained"].as_array().map_or(false, |u| u.iter().any(|i| i["name"] == "A")));
+            assert!(flagged, "{}", r["state"]["snapshots"]);
+        }
+
+        // 舊碼會失敗：在看板手動刪一筆舊的轉帳，已刪帳戶的歷史也不可以被改
+        #[tokio::test]
+        async fn manual_retro_never_touches_deleted_account() {
+            let root = fresh("manual");
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            let mut m = serde_json::Map::new();
+            m.insert("2026-09-01".into(), st(Some(100.0), 1000.0));
+            m.insert("2026-09-02".into(), st(Some(0.0), 1100.0));
+            m.insert("2026-09-03".into(), st(None, 1100.0));
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+            let t = serde_json::json!({ "id": "m1", "type": "transfer", "date": "2026-09-02", "bank": "A", "bank_to": "B", "amount": 100.0, "currency": "TWD" });
+            std::fs::write(root.join("transactions.json"), serde_json::json!([t]).to_string()).unwrap();
+            let mut state = st(None, 1000.0);
+            state["transactions"] = serde_json::json!([]);
+            save_at(&root, state, None, vec![RetroOp { tx: t, direction: -1 }], "2026-09-04").await.unwrap();
+            assert_eq!(cash(&root, "2026-09-02", "B"), Some(1000.0));
+            assert_eq!(cash(&root, "2026-09-02", "A"), Some(0.0), "已刪的 A 不可被改");
+        }
+
+        // 鐵則不能擋到正常的修改：帳務管家改了金額 → 照常更新歷史
+        #[tokio::test]
+        async fn real_edit_still_updates_history() {
+            let root = fresh("edit");
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            let mut m = serde_json::Map::new();
+            for d in ["2026-09-01", "2026-09-02", "2026-09-03"] { m.insert(d.into(), st(Some(100.0), 1000.0)); }
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            put_budget(&root, true, serde_json::json!([e1(), i1()]));
+            load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            let mut e = e1(); e["amount"] = 60.0.into();
+            let mut i = i1(); i["amount"] = 60.0.into();
+            put_budget(&root, true, serde_json::json!([e, i]));
+            let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            assert!(r["warnings"].as_array().unwrap().is_empty(), "{:?}", r["warnings"]);
+            assert_eq!((cash(&root, "2026-09-02", "A"), cash(&root, "2026-09-02", "B")), (Some(40.0), Some(1060.0)));
+        }
+
+        // 第一輪審查 P1/P2：轉帳的另一邊帳戶原本沒對應（看板記成單筆），使用者之後把它對應到看板 →
+        // 單筆變成轉帳是正常操作，不可以被鐵則擋下、更不可以從此永久停止同步
+        #[tokio::test]
+        async fn mapping_the_other_side_turns_single_into_transfer() {
+            for (side, unmapped_first) in [("轉入", "yb"), ("轉出", "ya")] {
+                let root = fresh(&format!("remap_{}", unmapped_first));
+                std::fs::create_dir_all(root.join("snapshots")).unwrap();
+                let mut m = serde_json::Map::new();
+                for d in ["2026-09-01", "2026-09-02", "2026-09-03"] { m.insert(d.into(), st(Some(100.0), 1000.0)); }
+                std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+                std::fs::write(root.join("transactions.json"), "[]").unwrap();
+                let budget = |mapped_both: bool| {
+                    let acc = |id: &str, bank: &str| {
+                        let mut a = serde_json::json!({ "id": id, "currency": "TWD", "initial_balance": 1000.0 });
+                        if mapped_both || id != unmapped_first { a["dashboard_bank_name"] = bank.into(); }
+                        a
+                    };
+                    std::fs::write(root.join("budget.json"), serde_json::json!({ "accounts": [acc("ya", "A"), acc("yb", "B")] }).to_string()).unwrap();
+                    std::fs::create_dir_all(root.join("budget")).unwrap();
+                    std::fs::write(root.join("budget/2026-09.json"), serde_json::json!([e1(), i1(),
+                        { "id": "n1", "account_id": "yb", "type": "expense", "amount": 1.0, "date": "2026-09-03", "category": "x" }]).to_string()).unwrap();
+                };
+                budget(false);
+                load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+                budget(true);
+                let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+                assert!(!warned(&r, "暫停同步"), "{}：{:?}", side, r["warnings"]);
+                assert!(has_transfer(&root), "{} 側對應後要變成一筆轉帳", side);
+                assert_eq!((cash(&root, "2026-09-02", "A"), cash(&root, "2026-09-02", "B")), (Some(0.0), Some(1100.0)), "{}", side);
+                let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+                assert_eq!(r["syncChanged"], false, "{}：第二次不再改", side);
+            }
+        }
+
+        // 第一輪審查 P3：v0.5.3 以前同步的轉帳沒有 amount_to 欄位 → 只是格式不同，不可擋
+        #[tokio::test]
+        async fn old_transfer_without_amount_to_is_not_blocked() {
+            let root = fresh("no_amount_to");
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            let mut m = serde_json::Map::new();
+            m.insert("2026-09-01".into(), st(Some(100.0), 1000.0));
+            m.insert("2026-09-02".into(), st(Some(0.0), 1100.0));
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+            let old = serde_json::json!({ "id": "budget_e1", "type": "transfer", "date": "2026-09-02", "bank": "A", "bank_to": "B", "currency": "TWD",
+                "amount": 100.0, "commission": 0, "note": "轉帳 · 退保", "budget_tx_id": "e1", "budget_tx_id_pair": "i1" });
+            std::fs::write(root.join("transactions.json"), serde_json::json!([old]).to_string()).unwrap();
+            put_budget(&root, true, serde_json::json!([e1(), i1()]));
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert!(r["warnings"].as_array().unwrap().is_empty(), "{:?}", r["warnings"]);
+            assert_eq!((cash(&root, "2026-09-02", "A"), cash(&root, "2026-09-02", "B")), (Some(0.0), Some(1100.0)));
+        }
+
+        // 舊版存的紀錄少了 currency 欄位：只是格式升級，不算違反鐵則
+        #[tokio::test]
+        async fn format_only_upgrade_is_allowed() {
+            let root = fresh("format");
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            let mut m = serde_json::Map::new();
+            m.insert("2026-09-01".into(), st(Some(100.0), 1000.0));
+            m.insert("2026-09-02".into(), st(Some(0.0), 1100.0));
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::Value::Object(m).to_string()).unwrap();
+            let old = serde_json::json!({ "id": "budget_e1", "type": "transfer", "date": "2026-09-02", "bank": "A", "bank_to": "B",
+                "amount": 100.0, "amount_to": 100.0, "commission": 0, "note": "轉帳 · 退保", "budget_tx_id": "e1", "budget_tx_id_pair": "i1" });
+            std::fs::write(root.join("transactions.json"), serde_json::json!([old]).to_string()).unwrap();
+            std::fs::write(root.join("sync.json"), r#"{"budget_to_dashboard":["e1","i1"]}"#).unwrap();
+            put_budget(&root, true, serde_json::json!([e1(), i1()]));
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert!(r["warnings"].as_array().unwrap().is_empty(), "{:?}", r["warnings"]);
+            assert_eq!((cash(&root, "2026-09-02", "A"), cash(&root, "2026-09-02", "B")), (Some(0.0), Some(1100.0)), "格式升級不改數字");
+        }
+    }
+
+    // 版本戳記：舊版不可寫進較新版用過的資料夾
+    mod version_stamp {
+        use super::super::*;
+        use super::snapshot_of_dir;
+        fn fresh(name: &str) -> std::path::PathBuf {
+            let d = std::env::temp_dir().join(format!("adb_ver_{}", std::process::id())).join(name);
+            let _ = std::fs::remove_dir_all(&d); std::fs::create_dir_all(&d).unwrap(); d
+        }
+        fn seed(root: &std::path::Path) {
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::json!({ "2026-09-01": {
+                "cash_accounts": [{ "bank": "A", "currency": "TWD", "amount": 100.0 }], "holdings": [], "exchange_rate": 31.0 } }).to_string()).unwrap();
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+        }
+        fn state() -> serde_json::Value {
+            serde_json::json!({ "cash_accounts": [{ "bank": "A", "currency": "TWD", "amount": 100.0 }], "holdings": [], "exchange_rate": 31.0, "transactions": [] })
+        }
+
+        #[tokio::test]
+        async fn write_stamps_version_and_idle_load_does_not() {
+            let root = fresh("stamp");
+            seed(&root);
+            load_at(Some(root.clone()), "2026-09-02").await.unwrap();
+            assert!(!root.join(storage::VERSION_FILE).exists(), "沒有要寫的東西時不可以為了戳記寫檔");
+            save_at(&root, state(), None, vec![], "2026-09-02").await.unwrap();
+            assert_eq!(storage::data_version(&root).await.as_deref(), Some(storage::APP_VERSION));
+        }
+
+        #[tokio::test]
+        async fn newer_folder_is_read_only() {
+            let root = fresh("newer");
+            seed(&root);
+            std::fs::write(root.join(storage::VERSION_FILE), r#"{"version":"99.0.0"}"#).unwrap();
+            let before = snapshot_of_dir(&root);
+            let r = load_at(Some(root.clone()), "2026-09-02").await.unwrap();
+            assert_eq!(r["writeBlocked"], true);
+            assert!(r["versionBlocked"].as_str().unwrap().contains("v99.0.0"), "{}", r["versionBlocked"]);
+            assert!(save_at(&root, state(), None, vec![], "2026-09-02").await.is_err());
+            assert!(refresh_at(&root, state(), None, "2026-09-02").await.is_err());
+            assert_eq!(snapshot_of_dir(&root), before, "一個檔都不能改");
+            assert!(!root.join("backup").exists(), "連每日備份都不做");
+        }
+
+        // 第一輪審查：戳記檔暫時讀不到（被雲端硬碟／防毒鎖住）不能讓存檔失敗、留下日誌
+        #[tokio::test]
+        async fn unreadable_stamp_does_not_break_saving() {
+            let root = fresh("locked");
+            seed(&root);
+            std::fs::create_dir_all(root.join(storage::VERSION_FILE)).unwrap(); // 讀不到的「檔案」
+            save_at(&root, state(), None, vec![], "2026-09-02").await.unwrap();
+            assert!(!root.join(storage::JOURNAL_FILE).exists());
+            let r = load_at(Some(root.clone()), "2026-09-02").await.unwrap();
+            assert_eq!(r["writeBlocked"], false);
+        }
+
+        // 戳記檔內容壞掉（例如被截斷）：照常重寫，版本保護不能就此失效
+        #[tokio::test]
+        async fn broken_stamp_is_rewritten() {
+            let root = fresh("broken_stamp");
+            seed(&root);
+            std::fs::write(root.join(storage::VERSION_FILE), "{\"vers").unwrap();
+            save_at(&root, state(), None, vec![], "2026-09-02").await.unwrap();
+            assert_eq!(storage::data_version(&root).await.as_deref(), Some(storage::APP_VERSION));
+        }
+
+        #[tokio::test]
+        async fn prerelease_suffix_is_understood() {
+            let root = fresh("beta");
+            seed(&root);
+            std::fs::write(root.join(storage::VERSION_FILE), r#"{"version":"99.1.0-beta"}"#).unwrap();
+            let r = load_at(Some(root.clone()), "2026-09-02").await.unwrap();
+            assert_eq!(r["writeBlocked"], true);
+        }
+
+        #[tokio::test]
+        async fn older_or_same_stamp_is_writable() {
+            for v in ["0.8.2", "0.1.0", "garbage"] {
+                let root = fresh(&format!("old_{}", v));
+                seed(&root);
+                std::fs::write(root.join(storage::VERSION_FILE), serde_json::json!({ "version": v }).to_string()).unwrap();
+                let r = load_at(Some(root.clone()), "2026-09-02").await.unwrap();
+                assert_eq!(r["writeBlocked"], false, "{}", v);
+                save_at(&root, state(), None, vec![], "2026-09-02").await.unwrap();
+                assert_eq!(storage::data_version(&root).await.as_deref(), Some(storage::APP_VERSION));
+            }
+        }
+    }
+
+    // 績效自我檢查（相鄰快照之間的變動，交易解釋得了嗎）
+    mod unexplained {
+        use super::super::*;
+        fn s(cash: &[(&str, &str, f64)], hold: &[(&str, f64, f64)]) -> serde_json::Value {
+            serde_json::json!({
+                "exchange_rate": 30.0,
+                "cash_accounts": cash.iter().map(|(b, c, a)| serde_json::json!({ "bank": b, "currency": c, "amount": a })).collect::<Vec<_>>(),
+                "holdings": hold.iter().map(|(sym, sh, p)| serde_json::json!({ "symbol": sym, "shares": sh, "price": p, "currency": "TWD" })).collect::<Vec<_>>(),
+            })
+        }
+        fn names(v: &[serde_json::Value]) -> Vec<String> { v.iter().map(|i| i["name"].as_str().unwrap().to_string()).collect() }
+
+        #[test]
+        fn account_vanishing_with_balance_is_flagged_in_twd() {
+            let v = unexplained_changes(&s(&[("U", "USD", 100.0)], &[]), &s(&[], &[]), &[]);
+            assert_eq!(names(&v), vec!["U"]);
+            assert_eq!(v[0]["delta"].as_f64(), Some(-100.0));
+            assert_eq!(v[0]["twd"].as_f64(), Some(-3000.0));
+        }
+        #[test]
+        fn zero_balance_account_removed_is_fine() {
+            assert!(unexplained_changes(&s(&[("U", "USD", 0.0)], &[]), &s(&[], &[]), &[]).is_empty());
+        }
+        #[test]
+        fn changes_explained_by_transactions_are_not_flagged() {
+            let txs = [
+                serde_json::json!({ "type": "transfer", "date": "d", "bank": "A", "bank_to": "B", "amount": 50.0 }),
+                serde_json::json!({ "type": "cash_out", "date": "d", "bank": "B", "amount": 10.0 }),
+                serde_json::json!({ "type": "buy", "date": "d", "bank": "A", "symbol": "X", "shares": 2.0, "amount": 40.0, "commission": 1.0 }),
+                serde_json::json!({ "type": "new_cash_account", "date": "d", "bank": "C", "amount": 7.0, "currency": "TWD" }),
+            ];
+            let w: Vec<&serde_json::Value> = txs.iter().collect();
+            let prev = s(&[("A", "TWD", 100.0), ("B", "TWD", 0.0)], &[("X", 1.0, 20.0)]);
+            let cur = s(&[("A", "TWD", 9.0), ("B", "TWD", 40.0), ("C", "TWD", 7.0)], &[("X", 3.0, 21.0)]);
+            assert!(unexplained_changes(&prev, &cur, &w).is_empty());
+        }
+        #[test]
+        fn account_appearing_without_transaction_is_flagged() {
+            let v = unexplained_changes(&s(&[], &[]), &s(&[("N", "TWD", 500.0)], &[]), &[]);
+            assert_eq!(names(&v), vec!["N"]);
+        }
+        #[test]
+        fn holding_removed_with_shares_is_flagged_at_last_price() {
+            let v = unexplained_changes(&s(&[], &[("X", 10.0, 50.0)]), &s(&[], &[]), &[]);
+            assert_eq!(names(&v), vec!["X"]);
+            assert_eq!(v[0]["twd"].as_f64(), Some(-500.0));
+        }
+        #[test]
+        fn rounding_dust_below_one_twd_is_ignored() {
+            assert!(unexplained_changes(&s(&[("A", "TWD", 100.0)], &[]), &s(&[("A", "TWD", 99.44)], &[]), &[]).is_empty());
+            assert_eq!(unexplained_changes(&s(&[("A", "TWD", 100.0)], &[]), &s(&[("A", "TWD", 98.9)], &[]), &[]).len(), 1);
+        }
+        // 補登過去日期的建立帳戶／建立持倉：歷史快照裡沒有它，第一次出現的那張不可誤報
+        #[test]
+        fn backdated_creation_is_not_flagged() {
+            let entries = vec![
+                ("2026-09-01".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-02".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-03".to_string(), s(&[("A", "TWD", 100.0), ("C", "TWD", 500.0)], &[("X", 10.0, 100.0)])),
+            ];
+            let txs = vec![
+                // 9/3 當天補登（id＝台灣 9/3 的毫秒時間戳）
+                serde_json::json!({ "id": "1788370000000", "type": "new_cash_account", "date": "2026-08-15", "bank": "C", "amount": 500.0 }),
+                serde_json::json!({ "id": "1788370000001", "type": "new_position", "date": "2026-08-20", "symbol": "X", "shares": 10.0, "price": 90.0 }),
+            ];
+            let out = snapshot_series(&entries, &txs);
+            assert!(out.iter().all(|x| x.get("unexplained").is_none()), "{:?}", out);
+        }
+        // 第二輪審查：今天記了交易、之後把日期改晚（id 還是當初那天）→ 前端寫 recorded_at，不可誤報
+        #[test]
+        fn edited_date_uses_recorded_at() {
+            let entries = vec![
+                ("2026-09-01".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-05".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-12".to_string(), s(&[("A", "TWD", 0.0)], &[])),
+            ];
+            // 9/2 記錄（id）、9/20 改成交易日 9/10：9/5 時歷史已被回沖，9/10 起才扣
+            let txs = vec![serde_json::json!({ "id": "1788300000000", "recorded_at": "2026-09-20", "type": "cash_out", "date": "2026-09-10", "bank": "A", "amount": 100.0 })];
+            let out = snapshot_series(&entries, &txs);
+            assert!(out.iter().all(|x| x.get("unexplained").is_none()), "{:?}", out);
+        }
+
+        // 第三輪審查：補登的建立持倉之後又被修改（recorded_at 變成修改那天），出現的那張仍然不可誤報
+        #[test]
+        fn edited_backdated_creation_still_explained() {
+            let entries = vec![
+                ("2026-09-02".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-03".to_string(), s(&[("A", "TWD", 100.0)], &[("X", 10.0, 100.0)])),
+                ("2026-09-20".to_string(), s(&[("A", "TWD", 100.0)], &[("X", 10.0, 100.0)])),
+            ];
+            let txs = vec![serde_json::json!({ "id": "1788370000001", "recorded_at": "2026-09-20", "type": "new_position", "date": "2026-08-15", "symbol": "X", "shares": 10.0, "price": 90.0, "note": "改過備註" })];
+            let out = snapshot_series(&entries, &txs);
+            assert!(out.iter().all(|x| x.get("unexplained").is_none()), "{:?}", out);
+        }
+
+        // 第二輪審查 O1：刪掉帳戶後用同名重建，不可以把很久以前那筆舊的建立交易再算一次
+        #[test]
+        fn recreating_same_name_does_not_reuse_old_creation() {
+            let entries = vec![
+                ("2026-09-01".to_string(), s(&[("A", "TWD", 300.0), ("B", "TWD", 1.0)], &[])),
+                ("2026-09-02".to_string(), s(&[("B", "TWD", 1.0)], &[])),
+                ("2026-09-03".to_string(), s(&[("A", "TWD", 100.0), ("B", "TWD", 1.0)], &[])),
+            ];
+            let txs = vec![
+                serde_json::json!({ "id": "1777000000000", "type": "new_cash_account", "date": "2026-04-24", "bank": "A", "amount": 300.0 }),
+                serde_json::json!({ "id": "1788370000000", "type": "new_cash_account", "date": "2026-09-03", "bank": "A", "amount": 100.0 }),
+            ];
+            let out = snapshot_series(&entries, &txs);
+            assert_eq!(out[1]["unexplained"][0]["delta"].as_f64(), Some(-300.0), "刪掉有錢的帳戶：該標");
+            assert!(out[2].get("unexplained").is_none(), "重建：不該標 {}", out[2]);
+        }
+        // 前端存檔當下就把未來日期的交易套到現況（id 是建立時的毫秒時間戳）：不可以今天標一次、到期那天再標一次
+        #[test]
+        fn future_dated_manual_transaction_counts_when_recorded() {
+            assert_eq!(taiwan_date_of_ms(1_788_278_400_000), "2026-09-02"); // 2026-09-01T16:00Z = 台灣 9/2 00:00
+            let id = "1788300000000"; // 台灣 2026-09-02 記的
+            let entries = vec![
+                ("2026-09-01".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-02".to_string(), s(&[("A", "TWD", 50.0)], &[])),
+                ("2026-09-10".to_string(), s(&[("A", "TWD", 50.0)], &[])),
+            ];
+            let txs = vec![serde_json::json!({ "id": id, "type": "cash_out", "date": "2026-09-08", "bank": "A", "amount": 50.0 })];
+            let out = snapshot_series(&entries, &txs);
+            assert!(out.iter().all(|x| x.get("unexplained").is_none()), "{:?}", out);
+        }
+        // 帳戶已經存在時，前端的 new_cash_account 什麼都不做；後端要同樣不算
+        #[test]
+        fn new_cash_account_on_existing_account_adds_nothing() {
+            let tx = serde_json::json!({ "type": "new_cash_account", "date": "d", "bank": "A", "amount": 100.0 });
+            assert!(unexplained_changes(&s(&[("A", "TWD", 10.0)], &[]), &s(&[("A", "TWD", 10.0)], &[]), &[&tx]).is_empty());
+        }
+        #[test]
+        fn issue_carries_the_compared_date() {
+            let entries = vec![
+                ("2026-09-01".to_string(), s(&[("A", "TWD", 100.0), ("B", "TWD", 1.0)], &[])),
+                ("2026-09-05".to_string(), s(&[("B", "TWD", 1.0)], &[])),
+            ];
+            let out = snapshot_series(&entries, &[]);
+            assert_eq!(out[1]["unexplained"][0]["from"], "2026-09-01");
+        }
+        // 刪掉還有錢的帳戶後存檔：馬上回傳今天的標記（不用等下次開 App）
+        #[tokio::test]
+        async fn save_reports_today_unexplained_immediately() {
+            let root = std::env::temp_dir().join(format!("adb_today_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("snapshots")).unwrap();
+            std::fs::write(root.join("snapshots/2026-09.json"), serde_json::json!({ "2026-09-01": s(&[("A", "TWD", 100.0), ("B", "TWD", 5.0)], &[]) }).to_string()).unwrap();
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            let mut st = s(&[("B", "TWD", 5.0)], &[]);
+            st["transactions"] = serde_json::json!([]);
+            let r = save_at(&root, st.clone(), None, vec![], "2026-09-02").await.unwrap();
+            assert_eq!(r["todayUnexplained"][0]["name"], "A", "{}", r);
+            // 補回帳戶後再存：標記清掉
+            let mut back = s(&[("A", "TWD", 100.0), ("B", "TWD", 5.0)], &[]);
+            back["transactions"] = serde_json::json!([]);
+            let r = save_at(&root, back, None, vec![], "2026-09-02").await.unwrap();
+            assert!(r["todayUnexplained"].is_null(), "{}", r);
+        }
+
+        // 沒開 App 的那天記的交易，算在下一張快照
+        #[test]
+        fn series_attributes_transactions_between_snapshots() {
+            let entries = vec![
+                ("2026-09-01".to_string(), s(&[("A", "TWD", 100.0)], &[])),
+                ("2026-09-05".to_string(), s(&[("A", "TWD", 70.0)], &[])),
+                ("2026-09-06".to_string(), s(&[("A", "TWD", 50.0)], &[])),
+            ];
+            let txs = vec![serde_json::json!({ "type": "cash_out", "date": "2026-09-03", "bank": "A", "amount": 30.0 })];
+            let out = snapshot_series(&entries, &txs);
+            assert!(out[1].get("unexplained").is_none(), "{}", out[1]);
+            assert_eq!(out[2]["unexplained"][0]["delta"].as_f64(), Some(-20.0));
         }
     }
 }

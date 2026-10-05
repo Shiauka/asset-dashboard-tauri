@@ -64,6 +64,8 @@ export default function EditTransactionDialog({ open, onClose, transaction: tx, 
   const isStockTx = tx.type === 'buy' || tx.type === 'sell'
   const isCashTx = tx.type === 'cash_in' || tx.type === 'cash_out'
   const isNewPos = tx.type === 'new_position'
+  // 建立現金／建立股票只能改備註（改數字會把之後所有交易對它的影響蓋掉）
+  const isCreation = isNewPos || tx.type === 'new_cash_account'
 
   const matchingAccounts = cashAccounts.filter(c => c.currency === tx.currency)
 
@@ -111,6 +113,12 @@ export default function EditTransactionDialog({ open, onClose, transaction: tx, 
         </DialogHeader>
 
         <div className="space-y-4 py-2">
+          {isCreation && (
+            <p className="text-xs text-muted-foreground">
+              這是建立帳戶／股票時的紀錄，只能修改備註。要調整金額或股數，請另外記一筆買進／賣出或現金存入／提出。
+            </p>
+          )}
+          <fieldset disabled={isCreation} className="space-y-4 disabled:opacity-60">
           <Row label="日期">
             <Input type="date" value={date} onChange={e => setDate(e.target.value)} />
           </Row>
@@ -186,6 +194,8 @@ export default function EditTransactionDialog({ open, onClose, transaction: tx, 
               </Select>
             </Row>
           )}
+
+          </fieldset>
 
           <Row label="備註" sublabel="選填">
             <Input placeholder="" value={note} onChange={e => setNote(e.target.value)} />

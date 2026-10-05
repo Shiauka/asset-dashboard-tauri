@@ -8,6 +8,7 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import type { AppState } from '@/lib/types'
 import { computeTWR, computeTaxSummary } from '@/lib/calc'
+import { AlertTriangle } from 'lucide-react'
 
 const fmt = (n: number, d = 0) =>
   new Intl.NumberFormat('zh-TW', { minimumFractionDigits: d, maximumFractionDigits: d }).format(n)
@@ -57,9 +58,20 @@ function downsample<T>(arr: T[], max = 80): T[] {
   return arr.filter((_, i) => i % step === 0 || i === arr.length - 1)
 }
 
+const ACK_KEY = 'asset_dashboard_ack_unexplained'
+const ackKey = (u: { date: string; name: string; delta: number }) => `${u.date}|${u.name}|${u.delta.toFixed(4)}`
+
 export default function TwrPanel({ state, blurred }: { state: AppState; blurred: boolean }) {
   const TARGET = state.retirement?.expected_annual_return ?? 0.117
   const [breakdownView, setBreakdownView] = useState<'yearly' | 'monthly'>('yearly')
+  // 使用者確認過的「找不到交易的變動」（例如自己刪掉有餘額的帳戶）：不再顯示，但照樣排除在報酬率外
+  const [acked, setAcked] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem(ACK_KEY) ?? '[]') } catch { return [] }
+  })
+  const saveAcked = (v: string[]) => {
+    setAcked(v)
+    try { localStorage.setItem(ACK_KEY, JSON.stringify(v)) } catch { /* 無法保存時只在這次開啟有效 */ }
+  }
 
   const twr = useMemo(
     () => computeTWR(state.snapshots ?? [], state.transactions, state.exchange_rate),
@@ -97,8 +109,67 @@ export default function TwrPanel({ state, blurred }: { state: AppState; blurred:
   // Only show last 24 months in the bar chart to avoid overcrowding
   const monthlyBarTrimmed = monthlyBar.slice(-24)
 
+  // 績效自我檢查：相鄰兩張快照之間找不到對應交易的變動（已從報酬率排除，這裡明確列出）
+  const allUnexplained = (state.snapshots ?? [])
+    .flatMap(s => (s.unexplained ?? []).map(u => ({ ...u, date: s.date })))
+    .sort((a, b) => b.date.localeCompare(a.date))
+  const unexplained = allUnexplained.filter(u => !acked.includes(ackKey(u)))
+  const ackedCount = allUnexplained.length - unexplained.length
+  const unexplainedUp = unexplained.reduce((sum, u) => sum + Math.max(0, u.twd), 0)
+  const unexplainedDown = unexplained.reduce((sum, u) => sum + Math.min(0, u.twd), 0)
+  const when = (u: { date: string; from?: string }) => {
+    if (!u.from) return u.date
+    const next = new Date(`${u.from}T00:00:00Z`); next.setUTCDate(next.getUTCDate() + 1)
+    const first = next.toISOString().slice(0, 10)
+    return first >= u.date ? u.date : `${first}～${u.date} 之間`
+  }
+  const describe = (u: { kind: string; delta: number; currency: string; twd: number }) => {
+    const dir = u.delta > 0 ? '多了' : '少了'
+    if (u.kind === 'holding') {
+      const shares = fmt(Math.abs(u.delta), 4).replace(/\.?0+$/, '')
+      return `${dir} ${shares} 股${u.twd !== 0 ? `（約 ${fmt(Math.abs(u.twd))} 元）` : '（查不到價格，金額未知）'}`
+    }
+    if (u.currency === 'USD') return `${dir} ${fmt(Math.abs(u.delta), 2)} 美元（約 ${fmt(Math.abs(u.twd))} 元）`
+    return `${dir} ${fmt(Math.abs(u.delta))} 元`
+  }
+
   return (
     <div className="space-y-4">
+
+      {unexplained.length > 0 && (
+        <div role="alert" className="flex items-start gap-3 rounded-lg border border-amber-500 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+          <AlertTriangle size={16} className="text-amber-500 mt-0.5 flex-shrink-0" />
+          <div className="space-y-1.5 min-w-0">
+            <p className="font-semibold">
+              有 {unexplained.length} 筆金額變動，找不到是哪筆交易造成的
+              {!blurred && (unexplainedDown < 0 || unexplainedUp > 0) &&
+                `（${[unexplainedDown < 0 ? `少了約 ${fmt(-unexplainedDown)} 元` : '', unexplainedUp > 0 ? `多了約 ${fmt(unexplainedUp)} 元` : ''].filter(Boolean).join('、')}）`}
+            </p>
+            <ul className="space-y-0.5">
+              {unexplained.map((u, i) => (
+                <li key={i} className="tabular-nums">
+                  {when(u)}：{u.name} {blurred ? '***' : describe(u)}
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs">
+              這些變動已經從下面的報酬率排除，不會被算成賺或賠。
+              如果是你自己做的（例如刪掉一個還有錢的帳戶或持倉），可以不用處理。
+              如果你沒做過這些事，代表資料可能被改動過：請先不要補記交易（會變成重複計算），資料夾裡的 backup 保存了最近 14 個有開過看板的日子的自動備份，可以請熟悉的人協助比對是哪一天開始不一樣。
+            </p>
+            <button type="button" className="text-xs underline underline-offset-2"
+              onClick={() => saveAcked([...acked, ...unexplained.map(ackKey)])}>
+              這些我都確認過了，不再顯示
+            </button>
+          </div>
+        </div>
+      )}
+      {ackedCount > 0 && (
+        <p className="text-xs text-muted-foreground">
+          另有 {ackedCount} 筆確認過的金額變動沒有顯示，同樣已排除在報酬率外。
+          <button type="button" className="ml-1 underline underline-offset-2" onClick={() => saveAcked([])}>重新顯示</button>
+        </p>
+      )}
 
       {/* Summary cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">

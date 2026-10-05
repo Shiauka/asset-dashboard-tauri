@@ -52,6 +52,9 @@ export interface Transaction {
   bank_to?: string
   amount_to?: number
   currency_to?: Currency
+  // 最後一次在看板記錄／修改的那天（YYYY-MM-DD）。看板存檔當下就把交易套到現況（未來日期也是），
+  // 所以「實際進到看板」的日期是交易日與這天較早的那個。沒有這欄時用 id（建立當下的毫秒時間戳）推算
+  recorded_at?: string
 }
 
 export interface RetirementSettings {
@@ -71,6 +74,17 @@ export interface DailySnapshot {
   holdings_twd?: Record<string, number>           // symbol/bank → TWD value
   holdings_shares?: Record<string, number>        // symbol → share count
   exchange_rate?: number                          // USD/TWD rate recorded at snapshot time (Feature 7)
+  // 跟前一張快照相比，找不到對應交易的變動（後端績效自我檢查算的）。報酬率把它當成資金進出排除
+  unexplained?: UnexplainedChange[]
+}
+
+export interface UnexplainedChange {
+  kind: 'cash' | 'holding'
+  name: string        // 帳戶名稱或標的代號
+  delta: number       // 原幣金額（現金）或股數（持倉）
+  currency: string
+  twd: number         // 換算台幣
+  from?: string       // 跟哪一天的快照比（中間沒開 App 的日子，變動發生在 from 之後到這張之間）
 }
 
 // 緊急備用金：一筆「釘住的絕對金額」，完全不參與配置比例計算。

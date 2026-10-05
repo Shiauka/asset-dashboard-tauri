@@ -14,6 +14,43 @@ use std::path::{Path, PathBuf};
 pub type SnapMap = Map<String, Value>;
 
 pub const JOURNAL_FILE: &str = ".journal.json";
+
+// ── 版本戳記：較舊的看板不可以寫進較新版用過的資料夾 ───────────────────────────
+// 2026-10-03：Windows 上還留著舊版看板，開到它之後用舊的同步規則把一筆轉帳拆掉、改寫了 9 月的歷史。
+// 從這版起，每次寫入都記下寫入者的版本；版本比戳記舊的程式只能讀、不能寫。
+// （這版之前已經發出去的舊版不認得這個檔，擋不住，只能靠績效自我檢查事後抓出來）
+pub const VERSION_FILE: &str = "dashboard-version.json";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    // 「0.9.0-beta」這種帶後綴的：只看前面的數字
+    let mut it = v.trim().split('.').map(|x| {
+        let digits: String = x.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().ok()
+    });
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+/// 資料夾最後一次被哪個版本寫入（沒有戳記或讀不懂 → None）
+pub async fn data_version(root: &Path) -> Option<String> {
+    match read_json::<Value>(&root.join(VERSION_FILE)).await {
+        FileRead::Ok(v) => v["version"].as_str().map(String::from),
+        _ => None,
+    }
+}
+
+/// 資料夾是被比自己新的版本寫過的 → 回傳那個版本
+pub async fn newer_data_version(root: &Path) -> Option<String> {
+    let v = data_version(root).await?;
+    match (parse_version(&v), parse_version(APP_VERSION)) {
+        (Some(d), Some(me)) if d > me => Some(v),
+        _ => None,
+    }
+}
+
+pub fn newer_version_message(v: &str) -> String {
+    format!("這個資料夾已經被較新版的看板（v{}）使用過，目前開的是 v{}。舊版的同步規則可能把新版整理好的資料改壞，所以只能看、不能存。請關掉這個視窗、改開最新版的看板（如果電腦裡同時裝了兩個版本，請把舊的移除）", v, APP_VERSION)
+}
 pub const DAILY_BACKUP_KEEP: usize = 14;
 /// 當天備份缺檔的標記（同一天再跑會重做）
 pub const INCOMPLETE_MARKER: &str = "_INCOMPLETE.txt";
@@ -295,9 +332,24 @@ impl Txn {
     /// 先寫日誌、再逐一套用、最後刪日誌。任何一步失敗就回 Err（日誌留著，下次載入會重放）。
     ///
     /// 回傳 Err 時訊息以 "APPLIED:" 開頭代表資料其實已全部寫入、只是日誌清不掉（下次載入會清）。
-    pub async fn commit(self, root: &Path) -> Result<(), String> {
+    pub async fn commit(mut self, root: &Path) -> Result<(), String> {
         if self.ops.is_empty() {
             return Ok(());
+        }
+        // 寫入前最後確認：資料夾沒有被更新的版本用過；並把自己的版本記下來（跟這次的資料同一筆寫入）
+        if let Some(newer) = newer_data_version(root).await {
+            return Err(newer_version_message(&newer));
+        }
+        // 只在確定讀得到（或檔案不存在）時才更新戳記：戳記檔暫時被鎖住時不能讓整次存檔失敗
+        let stamp_needed = match read_json::<Value>(&root.join(VERSION_FILE)).await {
+            FileRead::Missing => true,
+            FileRead::Ok(v) => v["version"].as_str() != Some(APP_VERSION),
+            // 內容壞掉（例如被截斷）：照常重寫，壞檔會先被保留；暫時讀不到（被鎖住）：這次先不動
+            FileRead::Broken(_) => true,
+            FileRead::Unreadable(_) => false,
+        };
+        if stamp_needed {
+            self.write_json(VERSION_FILE, &serde_json::json!({ "version": APP_VERSION }))?;
         }
         let journal = root.join(JOURNAL_FILE);
         // 已經有未完成的日誌：絕不能蓋掉它（裡面可能還有沒寫完的內容）
@@ -504,6 +556,9 @@ pub async fn blocking_problems(root: &Path) -> Vec<String> {
     }
     if tokio::fs::metadata(root.join(JOURNAL_FILE)).await.is_ok() {
         v.push("有一筆上次沒完成的寫入（請關閉並重新開啟程式讓它自動補完）".into());
+    }
+    if let Some(newer) = newer_data_version(root).await {
+        v.push(newer_version_message(&newer));
     }
     match list_month_files(&root.join("snapshots")).await {
         Ok(files) => {
