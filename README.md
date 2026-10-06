@@ -10,11 +10,12 @@
 
 | 平台 | 版本 | 下載 |
 |------|------|------|
-| Windows 10 / 11 | v0.8.1 | [asset-dashboard_0.8.1_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v0.8.1/asset-dashboard_0.8.1_x64-setup.exe) |
+| Windows 10 / 11 | v1.0.0 | [asset-dashboard_1.0.0_x64-setup.exe](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v1.0.0/asset-dashboard_1.0.0_x64-setup.exe) |
+| macOS（Apple 晶片） | v1.0.0 | [asset-dashboard_1.0.0_aarch64.dmg](https://github.com/Shiauka/asset-dashboard-tauri/releases/download/v1.0.0/asset-dashboard_1.0.0_aarch64.dmg) |
 
 所有版本：[Releases 頁面](https://github.com/Shiauka/asset-dashboard-tauri/releases)
 
-> 目前僅提供 Windows 預編譯版本。macOS / Linux 使用者請參考下方[自行編譯](#自行編譯)章節。
+> Mac 版第一次開啟如果被擋下，請到「系統設定 → 隱私權與安全性」按「仍要打開」。Intel Mac 與 Linux 使用者請參考下方[自行編譯](#自行編譯)章節。
 
 ---
 
