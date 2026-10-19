@@ -55,6 +55,8 @@ export interface Transaction {
   // 最後一次在看板記錄／修改的那天（YYYY-MM-DD）。看板存檔當下就把交易套到現況（未來日期也是），
   // 所以「實際進到看板」的日期是交易日與這天較早的那個。沒有這欄時用 id（建立當下的毫秒時間戳）推算
   recorded_at?: string
+  // 對帳警告的「以帳務管家為準校正」記下的現金入／出：看板照常套用，跟帳務管家對帳時不計入
+  reconcile?: boolean
 }
 
 export interface RetirementSettings {

@@ -1093,6 +1093,13 @@ async fn sync_budget_into_state(
     let mut unmapped: BTreeSet<String> = BTreeSet::new();
     let mut kept_deleted: Vec<String> = Vec::new();
     let mut kept_unmapped = 0usize;
+    let mut moved_out = 0usize;
+    // 每筆已同步的單筆交易，同步當時在帳務管家的哪個帳戶（判斷「交易被改到別的帳戶」用）
+    let prev_accounts: serde_json::Map<String, serde_json::Value> = sync[SYNC_TX_ACCOUNTS].as_object().cloned().unwrap_or_default();
+    // 帳務管家帳戶 → 最後對應過的看板帳戶（現在有對應的以現在為準；取消對應後保留最後一次）
+    let prev_account_banks: serde_json::Map<String, serde_json::Value> = sync[SYNC_ACCOUNT_BANKS].as_object().cloned().unwrap_or_default();
+    let mut account_banks = prev_account_banks.clone();
+    for (id, (bank, _)) in &acc_map { account_banks.insert(id.clone(), serde_json::json!(bank)); }
     // 已同步清單裡、這次三方都看不到的 id：帳戶目前沒對應時要原樣留在清單裡（不然重建清單時會掉，
     // 重新對應後 v0.7.1 刪過的交易會被當成新的加回來；第十輪審查）
     let retained_unmapped: Vec<String> = before.iter()
@@ -1136,8 +1143,22 @@ async fn sync_budget_into_state(
             }
             // 帳務管家還有這筆，只是帳戶取消對應／被刪：那筆錢真的花過，保留看板上的紀錄與歷史，不回沖
             if still_in_budget(existing) && account_unmapped(existing) {
-                kept_unmapped += 1;
-                continue;
+                // 例外（祿哥 2026-10-19）：單筆交易本身被改到別的帳戶（例如記錯銀行、改成信用卡）→ 照常移除並退回。
+                // 只認「同步當時記下的帳務管家帳戶」跟現在不同；沒有紀錄（舊資料）或帳戶沒換（取消對應、封存）一律照舊保留。
+                // 不用「看板帳戶還有別的帳戶對應」推測：共用看板帳戶的舊帳戶取消對應時會誤退（審查 🔴）
+                // 另外，現在的帳戶如果曾經對應過這個看板帳戶（例如後來封存、取消對應），也照舊保留（第二輪審查 🟠）
+                let moved = existing["budget_tx_id_pair"].is_null()
+                    && existing["budget_tx_id"].as_str().map_or(false, |id| {
+                        let now = budget_by_id.get(id).and_then(|t| t["account_id"].as_str());
+                        let changed = prev_accounts.get(id).and_then(|v| v.as_str()).map_or(false, |was| Some(was) != now);
+                        let was_this_bank = now.and_then(|a| account_banks.get(a)).and_then(|v| v.as_str()) == existing["bank"].as_str();
+                        changed && !was_this_bank
+                    });
+                if !moved {
+                    kept_unmapped += 1;
+                    continue;
+                }
+                moved_out += 1;
             }
         }
         if let Some(want) = d {
@@ -1207,10 +1228,14 @@ async fn sync_budget_into_state(
     // 每次開啟都提示只會干擾（祿哥 2026-10-02：只留真的出錯的）。
     // 注意：現金對帳只比對「仍有對應」的帳戶。帳戶整個取消對應或在帳務管家被刪，就不在比對範圍內——
     // 那是使用者自己選的狀態（帳務管家現在改成封存、且餘額要先歸 0），不是安全網。
-    out.notes = serde_json::json!({ "keptDeleted": kept_deleted.len(), "keptUnmapped": kept_unmapped });
+    out.notes = serde_json::json!({ "keptDeleted": kept_deleted.len(), "keptUnmapped": kept_unmapped, "movedOut": moved_out });
     if removed_today > 0 {
         out.warnings.push(format!(
             "帳務管家那邊刪除了 {} 筆交易，看板已跟著移除（如果不是你刪的，請檢查帳務管家的資料）", removed_today));
+    }
+    if moved_out > 0 {
+        out.warnings.push(format!(
+            "帳務管家把 {} 筆交易改到沒有對應看板的帳戶（例如改成信用卡），看板已移除這些紀錄並退回金額", moved_out));
     }
     if !unmapped.is_empty() {
         out.warnings.push(format!("帳務管家設定對應的看板帳戶不存在：{}（相關交易尚未同步）",
@@ -1233,8 +1258,28 @@ async fn sync_budget_into_state(
     if before != synced_ids {
         txn.sync_key("budget_to_dashboard", serde_json::json!(synced_ids));
     }
+    // 記下看板上每筆單筆同步交易目前所在、有對應看板的帳務管家帳戶；帳戶現在沒對應的沿用舊紀錄
+    let mut accounts = serde_json::Map::new();
+    for t in dash_txs.iter().filter(|t| t["budget_tx_id_pair"].is_null()) {
+        let Some(id) = t["budget_tx_id"].as_str() else { continue };
+        let now = budget_by_id.get(id).and_then(|b| b["account_id"].as_str()).filter(|a| acc_map.contains_key(*a));
+        if let Some(acc) = now.map(String::from).or_else(|| prev_accounts.get(id).and_then(|v| v.as_str()).map(String::from)) {
+            accounts.insert(id.to_string(), serde_json::json!(acc));
+        }
+    }
+    if accounts != prev_accounts {
+        txn.sync_key(SYNC_TX_ACCOUNTS, serde_json::Value::Object(accounts));
+    }
+    if account_banks != prev_account_banks {
+        txn.sync_key(SYNC_ACCOUNT_BANKS, serde_json::Value::Object(account_banks));
+    }
     Ok(out)
 }
+
+/// sync.json 裡看板自己的 key：已同步交易 id → 帳務管家帳戶 id
+pub(crate) const SYNC_TX_ACCOUNTS: &str = "budget_tx_accounts";
+/// sync.json 裡看板自己的 key：帳務管家帳戶 id → 最後對應過的看板帳戶
+pub(crate) const SYNC_ACCOUNT_BANKS: &str = "budget_account_banks";
 
 /// 在副本上跑同步，成功才採用（失敗時 state / 快取 / Txn 都維持原樣，只回報原因）
 async fn sync_trial(
@@ -1344,9 +1389,12 @@ fn compute_ledger_mismatches(
     let start = earliest.unwrap_or_default();
     for t in state["transactions"].as_array().cloned().unwrap_or_default() {
         if t["budget_tx_id"].is_string() { continue; }
+        // 使用者按「以帳務管家為準校正」記下的紀錄：只用來把看板對齊帳目，帳目那邊不算
+        if t["reconcile"].as_bool() == Some(true) { continue; }
         if t["id"].as_str().map_or(false, |id| mirrored.contains(id)) { continue; }
         let Some(date) = t["date"].as_str() else { continue };
-        if date < start.as_str() || date > today { continue; }
+        // 看板自己記的交易，存檔當下就套到現況（未來日期也是），所以這裡不排除未來日期
+        if date < start.as_str() { continue; }
         let amt = t["amount"].as_f64().unwrap_or(0.0);
         let fee = t["commission"].as_f64().unwrap_or(0.0);
         let bank = t["bank"].as_str().unwrap_or("");
@@ -1524,6 +1572,7 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
 
     let write_blocked = !broken.is_empty();
     let mut sync_changed = false;
+    let mut sync_failed = false;
     let mut sync_notes = serde_json::Value::Null;
     let mut merged_opt: Option<(String, serde_json::Value)> = cache.maps.values()
         .flat_map(|m| m.iter()).max_by(|a, b| a.0.cmp(b.0))
@@ -1539,8 +1588,14 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
             let before = (merged.clone(), cache.maps.clone());
             let o = sync_trial(&root, merged, &today, &mut cache, &mut txn).await;
             sync_notes = o.notes.clone();
+            sync_failed = o.notes.is_null();
             warnings.extend(o.warnings);
-            if o.changed {
+            if !o.changed && !txn.is_empty() {
+                // 看板內容沒變、只有 sync.json 裡的帳戶紀錄要更新：也要寫，不然之後判斷「交易換了帳戶」會用到舊紀錄
+                if let Err(e) = txn.commit(&root).await {
+                    if !e.starts_with("APPLIED:") { warnings.push(format!("更新同步紀錄失敗：{}", e)); }
+                }
+            } else if o.changed {
                 // 同步改到的現金要立刻落地成今天的快照，不能只留在記憶體
                 if let Some(mf) = month_file_of(&today) {
                     let lean = lean_state(merged);
@@ -1586,7 +1641,8 @@ async fn load_at(root: Option<PathBuf>, today: &str) -> Result<serde_json::Value
     let dates: Vec<String> = all_entries.iter().map(|(d, _)| d.clone()).collect();
     merged["snapshots"] = serde_json::json!(snaps);
 
-    let cash_mismatches = if write_blocked { Vec::new() } else { ledger_cash_mismatches(&root, &merged, &today).await };
+    // 同步暫停時看板跟帳目本來就對不上（差額有一部分是暫時的），不給對帳差額，免得被拿去校正（第二輪審查 🟠）
+    let cash_mismatches = if write_blocked || sync_failed { Vec::new() } else { ledger_cash_mismatches(&root, &merged, &today).await };
     let rev = storage::revision(&root).await;
 
     Ok(serde_json::json!({
@@ -1803,7 +1859,10 @@ async fn save_at(
     let history_changed = had_retro || o.changed;
     let mut resp = serde_json::json!({
         "ok": true, "date": date, "rev": storage::revision(&root).await, "warnings": warnings,
-        "changed": o.changed, "state": state,
+        "changed": o.changed,
+        // 對帳警告跟著每次存檔更新（切回視窗時帳務管家可能已經改正；畫面上的校正按鈕不能用過期的差額）
+        "cashMismatches": if o.notes.is_null() && state.get("transactions").is_some() { Vec::new() } else { ledger_cash_mismatches(&root, &state, &date).await },
+        "state": state,
     });
     // 今天這張的自我檢查結果每次存檔都更新（例如剛刪掉一個還有餘額的帳戶，要馬上標出、馬上排除在報酬率外）
     if history_changed {
@@ -3151,6 +3210,38 @@ mod tests {
         let second = load_at(Some(root.clone()), &today).await.unwrap();
         println!("second: warnings={:?} syncChanged={} notes={}", second["warnings"], second["syncChanged"], second["syncNotes"]);
         assert_eq!(snapshot_of_dir(&root), before, "第二次載入不可改任何檔");
+        // 存一次檔（看板開啟、切回視窗都會）：記下已同步交易的帳戶，之後再載入仍然不改檔
+        let saved = save_at(&root, second["state"].clone(), second["rev"].as_str().map(String::from), Vec::new(), &today).await.unwrap();
+        println!("save: warnings={:?} mismatches={}", saved["warnings"], saved["cashMismatches"]);
+        let sync: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("sync.json")).unwrap()).unwrap();
+        println!("recorded accounts: {}", sync[SYNC_TX_ACCOUNTS].as_object().map_or(0, |m| m.len()));
+        let third = load_at(Some(root.clone()), &today).await.unwrap();
+        let after = snapshot_of_dir(&root);
+        let fourth = load_at(Some(root.clone()), &today).await.unwrap();
+        println!("fourth: warnings={:?} syncChanged={}", fourth["warnings"], fourth["syncChanged"]);
+        assert_eq!(third["syncChanged"], false);
+        assert_eq!(snapshot_of_dir(&root), after, "存檔後再載入不可改任何檔");
+        // 模擬按「以帳務管家為準校正」（同前端 handleReconcile）：校正後對帳一致、再載入仍一致
+        if std::env::var("REAL_DATA_RECONCILE").is_ok() {
+            let mut st = fourth["state"].clone();
+            for m in fourth["cashMismatches"].as_array().cloned().unwrap_or_default() {
+                let diff = ((m["ledger"].as_f64().unwrap() - m["dashboard"].as_f64().unwrap()) * 100.0).round() / 100.0;
+                let bank = m["bank"].as_str().unwrap();
+                let cur = st["cash_accounts"].as_array().unwrap().iter().find(|c| c["bank"] == bank).unwrap()["currency"].clone();
+                for c in st["cash_accounts"].as_array_mut().unwrap() {
+                    if c["bank"] == bank { c["amount"] = serde_json::json!(c["amount"].as_f64().unwrap() + diff); }
+                }
+                st["transactions"].as_array_mut().unwrap().push(serde_json::json!({ "id": "reconcile-test", "date": today,
+                    "type": if diff > 0.0 { "cash_in" } else { "cash_out" }, "bank": bank, "currency": cur, "amount": diff.abs(),
+                    "note": "對帳校正（以帳務管家為準）", "reconcile": true }));
+            }
+            let saved = save_at(&root, st, fourth["rev"].as_str().map(String::from), Vec::new(), &today).await.unwrap();
+            println!("reconcile save: mismatches={} warnings={:?}", saved["cashMismatches"], saved["warnings"]);
+            assert!(saved["cashMismatches"].as_array().unwrap().is_empty());
+            let fifth = load_at(Some(root.clone()), &today).await.unwrap();
+            assert!(fifth["cashMismatches"].as_array().unwrap().is_empty(), "{:?}", fifth["cashMismatches"]);
+            assert!(fifth["warnings"].as_array().unwrap().is_empty(), "{:?}", fifth["warnings"]);
+        }
     }
 
     // 看板刪掉帳戶、帳務管家仍對應它：已同步的交易不提示；之後有新交易進不來才是真的錯，要提示
@@ -3235,6 +3326,29 @@ mod tests {
         assert_eq!(got[0]["ledger"].as_f64(), Some(8440.0)); // 2912+88+40000-35060+500
         let ok = serde_json::json!({ "cash_accounts": [{ "bank": "元大 台幣現金", "amount": 8440.0 }], "transactions": own });
         assert!(compute_ledger_mismatches(&budget, &txs, &ok, "2026-09-30").is_empty());
+    }
+
+    // 「以帳務管家為準校正」的紀錄：看板照常套用、帳目不算 → 校正後對帳一致；刪掉校正紀錄差異又回來
+    #[test]
+    fn ledger_check_ignores_reconcile_entries() {
+        let budget = serde_json::json!({ "accounts": [{ "id": "yt", "dashboard_bank_name": "A", "initial_balance": 1000.0 }]});
+        let txs = vec![serde_json::json!({ "account_id": "yt", "type": "expense", "amount": 100.0, "date": "2026-09-01" })];
+        let fixed = serde_json::json!({ "cash_accounts": [{ "bank": "A", "amount": 900.0 }], "transactions": [
+            { "id": "r1", "type": "cash_in", "bank": "A", "amount": 30.0, "date": "2026-09-05", "reconcile": true }] });
+        assert!(compute_ledger_mismatches(&budget, &txs, &fixed, "2026-09-30").is_empty());
+        let plain = serde_json::json!({ "cash_accounts": [{ "bank": "A", "amount": 900.0 }], "transactions": [
+            { "id": "r1", "type": "cash_in", "bank": "A", "amount": 30.0, "date": "2026-09-05" }] });
+        assert_eq!(compute_ledger_mismatches(&budget, &txs, &plain, "2026-09-30").len(), 1, "一般現金入照常計入帳目");
+    }
+
+    // 看板自己記的未來日期現金異動：存檔當下已套到現況，對帳也要算進去，不能報假差異
+    #[test]
+    fn ledger_check_counts_future_dated_dashboard_entries() {
+        let budget = serde_json::json!({ "accounts": [{ "id": "yt", "dashboard_bank_name": "A", "initial_balance": 1000.0 }]});
+        let txs = vec![serde_json::json!({ "account_id": "yt", "type": "expense", "amount": 1.0, "date": "2026-09-01" })];
+        let st = serde_json::json!({ "cash_accounts": [{ "bank": "A", "amount": 899.0 }], "transactions": [
+            { "id": "f1", "type": "cash_out", "bank": "A", "amount": 100.0, "date": "2026-10-05" }] });
+        assert!(compute_ledger_mismatches(&budget, &txs, &st, "2026-09-30").is_empty());
     }
 
     #[tokio::test]
@@ -3474,19 +3588,29 @@ mod tests {
             assert!(r["syncNotes"]["keptUnmapped"].as_u64().unwrap_or(0) > 0, "{:?}", r["syncNotes"]); assert!(r["warnings"].as_array().unwrap().is_empty(), "穩定狀態不提示：{:?}", r["warnings"]);
         }
 
-        // 單筆支出從 A 改到沒對應的帳戶（對照組：v0.7.1 也是保留，非本輪造成）
+        // 單筆支出從 A 改到沒對應的帳戶（記錯銀行、改成信用卡）：A 仍有對應 → 移除並退回、歷史更正；改回來再同步
         #[tokio::test]
         async fn single_moved_to_unmapped_account() {
             let root = fresh("single_moved");
             put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
             std::fs::write(root.join("transactions.json"), "[]").unwrap();
-            put_budget(&root, "A", "B", serde_json::json!([{ "id": "s1", "account_id": "ya", "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]));
+            let on = |acc: &str| serde_json::json!([{ "id": "s1", "account_id": acc, "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]);
+            put_budget(&root, "A", "B", on("ya"));
             load_at(Some(root.clone()), "2026-09-03").await.unwrap();
-            put_budget(&root, "A", "B", serde_json::json!([{ "id": "s1", "account_id": "yc", "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]));
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+            put_budget(&root, "A", "B", on("yc"));
             let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
-            println!("single_moved cash={:?} warnings={} mism={}", cash(&root, "2026-09-02"), r["warnings"], r["cashMismatches"]);
-            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0), "規則：一律保留、不改歷史");
-            assert!(r["syncNotes"]["keptUnmapped"].as_u64().unwrap_or(0) > 0, "{:?}", r["syncNotes"]); assert!(r["warnings"].as_array().unwrap().is_empty(), "穩定狀態不提示：{:?}", r["warnings"]);
+            assert_eq!(cash(&root, "2026-09-02"), (1000.0, 1000.0), "退回、歷史更正");
+            assert_eq!(r["syncNotes"]["movedOut"], 1, "{:?}", r["syncNotes"]);
+            assert_eq!(r["warnings"].as_array().unwrap().len(), 1, "告知一次：{:?}", r["warnings"]);
+            assert!(r["cashMismatches"].as_array().map_or(true, |a| a.is_empty()), "對帳一致：{:?}", r["cashMismatches"]);
+            assert!(r["state"]["transactions"].as_array().unwrap().is_empty());
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert!(r["warnings"].as_array().unwrap().is_empty(), "之後不再提示：{:?}", r["warnings"]);
+            assert_eq!(cash(&root, "2026-09-02"), (1000.0, 1000.0), "不重複退");
+            put_budget(&root, "A", "B", on("ya"));
+            load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0), "改回 A 會重新同步（不可被當成使用者刪過）");
         }
 
         // 轉入帳戶取消對應期間，轉出側（仍對應）改金額；之後重新對應
@@ -3533,7 +3657,8 @@ mod tests {
             assert_eq!(cash(&root, "2026-09-02"), (1000.0, 1000.0));
         }
 
-        // 第九輪：兩個帳務管家帳戶對應同一個看板銀行，取消其中一個 → 保留、不改歷史、要提示
+        // 第九輪：兩個帳務管家帳戶對應同一個看板銀行，取消其中一個 → 保留、不改歷史
+        // （交易本身沒換帳戶；2026-10-19 審查 🔴：不可因為「看板銀行還有別的帳戶對應」就當成交易被移走而退回）
         #[tokio::test]
         async fn shared_bank_unmap_one_keeps_history() {
             let root = fresh("shared_bank");
@@ -3556,6 +3681,182 @@ mod tests {
                 assert!(r["syncNotes"]["keptUnmapped"].as_u64().unwrap_or(0) > 0, "{:?}", r["syncNotes"]); assert!(r["warnings"].as_array().unwrap().is_empty(), "穩定狀態不提示：{:?}", r["warnings"]);
             }
             assert_eq!(cash(&root, "2026-09-02"), (1000.0, 900.0), "不可回沖");
+        }
+
+        // 審查 🔴：已封存、餘額歸 0 的舊帳戶跟新帳戶共用看板銀行，事後清掉舊帳戶的對應 → 保留、對帳仍一致
+        #[tokio::test]
+        async fn unmap_archived_zero_balance_account_sharing_bank_keeps_history() {
+            let root = fresh("archived_shared");
+            put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            let acc = |old_bank: &str| serde_json::json!({ "accounts": [
+                { "id": "yold", "dashboard_bank_name": old_bank, "currency": "TWD", "initial_balance": 100.0, "archived": true },
+                { "id": "ynew", "dashboard_bank_name": "A", "currency": "TWD", "initial_balance": 900.0 }]});
+            std::fs::create_dir_all(root.join("budget")).unwrap();
+            std::fs::write(root.join("budget/2026-09.json"), serde_json::json!([
+                { "id": "o1", "account_id": "yold", "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]).to_string()).unwrap();
+            std::fs::write(root.join("budget.json"), acc("A").to_string()).unwrap();
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+            assert!(r["cashMismatches"].as_array().unwrap().is_empty(), "{:?}", r["cashMismatches"]);
+            std::fs::write(root.join("budget.json"), acc("").to_string()).unwrap();
+            for _ in 0..2 {
+                let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+                assert_eq!(r["syncNotes"]["movedOut"], 0, "{:?}", r["syncNotes"]);
+                assert!(r["warnings"].as_array().unwrap().is_empty(), "{:?}", r["warnings"]);
+                assert!(r["cashMismatches"].as_array().unwrap().is_empty(), "不可製造差異：{:?}", r["cashMismatches"]);
+            }
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0), "不可退回");
+        }
+
+        // 舊版同步、沒有帳戶紀錄的交易被改到沒對應的帳戶：無從確認是換了帳戶 → 照舊保留（交給校正按鈕）
+        #[tokio::test]
+        async fn moved_without_account_record_keeps_history() {
+            let root = fresh("moved_legacy");
+            put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            let on = |acc: &str| serde_json::json!([{ "id": "s1", "account_id": acc, "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]);
+            put_budget(&root, "A", "B", on("ya"));
+            load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            // 模擬舊版留下的 sync.json：沒有帳戶紀錄
+            let mut sync: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("sync.json")).unwrap()).unwrap();
+            assert_eq!(sync[SYNC_TX_ACCOUNTS]["s1"], "ya", "同步時要記下帳戶");
+            sync.as_object_mut().unwrap().remove(SYNC_TX_ACCOUNTS);
+            std::fs::write(root.join("sync.json"), sync.to_string()).unwrap();
+            put_budget(&root, "A", "B", on("yc"));
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+            assert_eq!(r["syncNotes"]["movedOut"], 0);
+        }
+
+        // ── 第二輪審查的重現情境 ──
+        fn rv3_warned(r: &serde_json::Value, s: &str) -> bool {
+            r["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains(s))
+        }
+        fn rv3_apply_reconcile(r: &serde_json::Value, today: &str) -> serde_json::Value {
+            let mut st = r["state"].clone();
+            let ms = r["cashMismatches"].as_array().cloned().unwrap_or_default();
+            for (i, m) in ms.iter().enumerate() {
+                let diff = m["ledger"].as_f64().unwrap() - m["dashboard"].as_f64().unwrap();
+                let bank = m["bank"].as_str().unwrap();
+                for c in st["cash_accounts"].as_array_mut().unwrap() {
+                    if c["bank"] == bank { c["amount"] = serde_json::json!(c["amount"].as_f64().unwrap() + diff); }
+                }
+                st["transactions"].as_array_mut().unwrap().push(serde_json::json!({
+                    "id": format!("rc{}", i), "date": today, "type": if diff > 0.0 { "cash_in" } else { "cash_out" },
+                    "bank": bank, "currency": "TWD", "amount": diff.abs(), "reconcile": true }));
+            }
+            st
+        }
+
+        // 同步暫停（鐵則中止）期間不給對帳差額（不能校正）；同步恢復後不可出現重複校正的差異
+        #[tokio::test]
+        async fn rv3_reconcile_during_sync_pause_double_counts() {
+            let root = fresh("rv3_pause");
+            put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            put_budget(&root, "A", "B", tr("ya", "yb", 100.0));
+            load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1100.0));
+            let e1 = tr("ya", "yb", 100.0)[0].clone();
+            let n1 = serde_json::json!({ "id": "n1", "account_id": "yb", "type": "expense", "amount": 50.0, "date": "2026-09-02", "category": "x" });
+            put_budget(&root, "A", "B", serde_json::json!([e1, n1]));
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            println!("pause: warnings={} mism={}", r["warnings"], r["cashMismatches"]);
+            assert!(rv3_warned(&r, "暫停同步"));
+            let st = rv3_apply_reconcile(&r, "2026-09-03");
+            let saved = save_at(&root, st, r["rev"].as_str().map(String::from), Vec::new(), "2026-09-03").await.unwrap();
+            println!("after reconcile: mism={} warnings={}", saved["cashMismatches"], saved["warnings"]);
+            // 照提示處理：把剩下那一邊也刪掉 → 同步恢復
+            put_budget(&root, "A", "B", serde_json::json!([n1]));
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            println!("resumed: warnings={} mism={}", r["warnings"], r["cashMismatches"]);
+            assert!(r["cashMismatches"].as_array().unwrap().is_empty(), "同步恢復後出現新差異（校正被重複套用）：{:?}", r["cashMismatches"]);
+        }
+
+        // 共用看板銀行：交易從 ynew 改到 yold（看板不變），之後 yold 取消對應 → 不可退回（有沒有存檔都一樣）
+        async fn rv3_shared(name: &str, save_between: bool) -> (serde_json::Value, std::path::PathBuf) {
+            let root = fresh(name);
+            put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            let meta = |old_bank: &str| serde_json::json!({ "accounts": [
+                { "id": "yold", "dashboard_bank_name": old_bank, "currency": "TWD", "initial_balance": 100.0 },
+                { "id": "ynew", "dashboard_bank_name": "A", "currency": "TWD", "initial_balance": 900.0 },
+                { "id": "yb", "dashboard_bank_name": "B", "currency": "TWD", "initial_balance": 1000.0 }]});
+            let tx = |acc: &str| serde_json::json!([{ "id": "s1", "account_id": acc, "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]);
+            std::fs::create_dir_all(root.join("budget")).unwrap();
+            std::fs::write(root.join("budget.json"), meta("A").to_string()).unwrap();
+            std::fs::write(root.join("budget/2026-09.json"), tx("ynew").to_string()).unwrap();
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+            // 帳務管家：這筆其實是舊帳戶的 → 改到 yold（同一個看板銀行）
+            std::fs::write(root.join("budget/2026-09.json"), tx("yold").to_string()).unwrap();
+            let r2 = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert!(r2["cashMismatches"].as_array().unwrap().is_empty());
+            // 看板內容沒變，但帳戶紀錄要在載入時就更新
+            let sync: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(root.join("sync.json")).unwrap()).unwrap();
+            assert_eq!(sync[SYNC_TX_ACCOUNTS]["s1"], "yold");
+            if save_between {
+                save_at(&root, r2["state"].clone(), r2["rev"].as_str().map(String::from), Vec::new(), "2026-09-03").await.unwrap();
+            }
+            let _ = r;
+            // 舊帳戶封存、清掉對應
+            std::fs::write(root.join("budget.json"), meta("").to_string()).unwrap();
+            let r3 = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            println!("{} save_between={} notes={} mism={} cash={:?}", name, save_between, r3["syncNotes"], r3["cashMismatches"], cash(&root, "2026-09-02"));
+            (r3, root)
+        }
+        #[tokio::test]
+        async fn rv3_shared_bank_move_then_unmap_with_save_between() {
+            let (r, root) = rv3_shared("rv3_shared_save", true).await;
+            assert_eq!(r["syncNotes"]["movedOut"], 0);
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+        }
+        #[tokio::test]
+        async fn rv3_shared_bank_move_then_unmap_load_only() {
+            let (r, root) = rv3_shared("rv3_shared_load", false).await;
+            assert_eq!(r["syncNotes"]["movedOut"], 0, "只有 load、沒有存檔時紀錄沒寫入 → 誤判為移走");
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+        }
+
+        // 看板沒開的期間，交易從 ynew 改到 yold、yold 又取消對應（兩件事一起發生）：yold 曾對應看板 A → 保留
+        #[tokio::test]
+        async fn moved_to_formerly_mapped_account_while_closed_keeps_history() {
+            let root = fresh("moved_closed");
+            put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            let meta = |old_bank: &str| serde_json::json!({ "accounts": [
+                { "id": "yold", "dashboard_bank_name": old_bank, "currency": "TWD", "initial_balance": 100.0 },
+                { "id": "ynew", "dashboard_bank_name": "A", "currency": "TWD", "initial_balance": 900.0 }]});
+            let tx = |acc: &str| serde_json::json!([{ "id": "s1", "account_id": acc, "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]);
+            std::fs::create_dir_all(root.join("budget")).unwrap();
+            std::fs::write(root.join("budget.json"), meta("A").to_string()).unwrap();
+            std::fs::write(root.join("budget/2026-09.json"), tx("ynew").to_string()).unwrap();
+            load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            std::fs::write(root.join("budget/2026-09.json"), tx("yold").to_string()).unwrap();
+            std::fs::write(root.join("budget.json"), meta("").to_string()).unwrap();
+            let r = load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            assert_eq!(r["syncNotes"]["movedOut"], 0, "{:?}", r["syncNotes"]);
+            assert_eq!(cash(&root, "2026-09-02"), (900.0, 1000.0));
+        }
+
+        // 從每日備份還原：帳戶紀錄一起回到那天 → 已退回的「移走」交易回來後仍會被偵測、再退回
+        #[tokio::test]
+        async fn rv3_restore_loses_account_record() {
+            let root = fresh("rv3_restore");
+            put_month(&root, &[("2026-09-01", 1000.0, 1000.0), ("2026-09-02", 1000.0, 1000.0)]);
+            std::fs::write(root.join("transactions.json"), "[]").unwrap();
+            let on = |acc: &str| serde_json::json!([{ "id": "s1", "account_id": acc, "type": "expense", "amount": 100.0, "date": "2026-09-01", "category": "x" }]);
+            put_budget(&root, "A", "B", on("ya"));
+            load_at(Some(root.clone()), "2026-09-03").await.unwrap();
+            load_at(Some(root.clone()), "2026-09-04").await.unwrap(); // 09-04 備份：含 s1
+            put_budget(&root, "A", "B", on("yc"));
+            let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            assert_eq!(r["syncNotes"]["movedOut"], 1);
+            storage::restore_daily_backup(&root, "2026-09-04").await.unwrap();
+            let r = load_at(Some(root.clone()), "2026-09-04").await.unwrap();
+            println!("after restore notes={} mism={} cash={:?}", r["syncNotes"], r["cashMismatches"], cash(&root, "2026-09-02"));
+            assert!(r["cashMismatches"].as_array().unwrap().is_empty(), "還原後差異：{:?}", r["cashMismatches"]);
         }
 
         // 第十輪：v0.7.1 刪過的同步交易，在「取消對應期間有寫入 → 重新對應」後不可復活

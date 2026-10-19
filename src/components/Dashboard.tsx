@@ -79,6 +79,11 @@ export default function Dashboard() {
   const [writeBlock, setWriteBlock] = useState<string | null>(null)
   const writeBlockRef = useRef<string | null>(null)
   const [notices, setNotices] = useState<string[]>([])
+  // 現金對帳差異：跟一般提醒分開，因為每一列有「以帳務管家為準校正」按鈕
+  const [mismatches, setMismatchesState] = useState<CashMismatch[]>([])
+  // 校正前要比對「最新」的差額：存檔回來後佇列的下一個工作馬上就跑，等不到重新 render，所以 ref 要同步更新
+  const mismatchesRef = useRef<CashMismatch[]>([])
+  const setMismatches = useCallback((m: CashMismatch[]) => { mismatchesRef.current = m; setMismatchesState(m) }, [])
   const revRef = useRef<string | null>(null)
   const diskQueue = useRef<Promise<unknown>>(Promise.resolve())
   const dirtyRef = useRef(false)
@@ -126,10 +131,11 @@ export default function Dashboard() {
       notify(`儲存失敗：${msg}`)
   }, [block, notify])
 
+  type CashMismatch = { bank: string; dashboard: number; ledger: number }
   type LoadBody = {
     ok?: boolean; code?: string; error?: string; state?: AppState; date?: string
     brokenFiles?: string[]; recoveredFiles?: string[]; warnings?: string[]
-    cashMismatches?: { bank: string; dashboard: number; ledger: number }[]
+    cashMismatches?: CashMismatch[]
     writeBlocked?: boolean; versionBlocked?: string | null; rev?: string; hasDailyBackup?: boolean; dailyBackups?: string[]
   }
 
@@ -158,14 +164,13 @@ export default function Dashboard() {
     if (body.code === 'EMPTY')
       msgs.push(`${EMPTY_FOLDER_NOTICE}要把目前畫面上的資料存進去，請按工具列的「存至根目錄」（下載圖示）；選錯資料夾的話到根目錄設定換回來即可。`)
     for (const w of body.warnings ?? []) msgs.push(w)
-    if (body.cashMismatches?.length)
-      msgs.push(`現金餘額與帳務管家的帳目不一致：${body.cashMismatches.map(m => `${m.bank}（看板 ${m.dashboard.toLocaleString()}／帳目 ${m.ledger.toLocaleString()}）`).join('；')}。請核對兩邊的紀錄。`)
+    setMismatches(body.cashMismatches ?? [])
     setNotices(msgs)
     dirtyRef.current = false
     return { loaded: body.ok && body.state ? toAppState(body.state) : null, body }
   }, [enqueue, block])
 
-  type SaveResult = { ok: boolean; date?: string; rev?: string; warnings?: string[]; changed?: boolean; state?: AppState; snapshots?: AppState['snapshots']; todayUnexplained?: UnexplainedChange[] | null }
+  type SaveResult = { ok: boolean; date?: string; rev?: string; warnings?: string[]; changed?: boolean; cashMismatches?: CashMismatch[]; state?: AppState; snapshots?: AppState['snapshots']; todayUnexplained?: UnexplainedChange[] | null }
   type Change = (s: AppState) => { next: AppState; retro: RetroOp[] }
 
   // 寫進資料夾（只在這裡呼叫 save_snapshot）：
@@ -191,6 +196,7 @@ export default function Dashboard() {
       const r = await invoke<SaveResult>('save_snapshot', { state: next, expectedRev: revRef.current, retro })
       if (r.rev) revRef.current = r.rev
       r.warnings?.forEach(notify)
+      if (r.cashMismatches) setMismatches(r.cashMismatches)
       let saved = r.state ? toAppState(r.state) : next
       if (r.snapshots) saved = { ...saved, snapshots: r.snapshots }
       if (r.date) saved = setSnapshotUnexplained(saved, r.date, r.todayUnexplained ?? undefined)
@@ -240,6 +246,7 @@ export default function Dashboard() {
     try {
       const saved = await persist(change)
       if (!saved) alert(`這筆變更沒有儲存：\n\n${writeBlockRef.current ?? '請看畫面上方的訊息。'}`)
+      return saved
     } finally {
       setBusy(false)
     }
@@ -398,6 +405,39 @@ export default function Dashboard() {
       next = retroactivelyAdjustSnapshots(next, tx)
       next = addSnapshot(next, totalAssetsTwd(next))
       return { next, retro: tx.date < getTaiwanToday() ? [{ tx, direction: 1 }] : [] }
+    })
+  }, [commitAfterSave])
+
+  // 對帳差異的「以帳務管家為準校正」：今天記一筆標記為校正的現金入／出，把看板對齊帳目。
+  // 帳目本身不計入這筆（否則兩邊一起動、永遠對不齊）；績效當成資金進出，不算報酬
+  const handleReconcile = useCallback(async (m: CashMismatch) => {
+    const diff = Math.round((m.ledger - m.dashboard) * 100) / 100
+    const acc = stateRef.current?.cash_accounts.find(c => c.bank === m.bank)
+    if (!acc) {
+      alert(`看板上沒有「${m.bank}」這個帳戶，無法校正。\n如果這個帳戶已經結清，請在帳務管家把它的餘額歸 0 後封存；如果還在用，請先在看板建立同名的現金帳戶。`)
+      return
+    }
+    const today = getTaiwanToday()
+    const fmtAmt = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 2 })
+    if (!confirm(`以帳務管家為準校正「${m.bank}」？\n\n看板 ${fmtAmt(m.dashboard)} → ${fmtAmt(m.ledger)}（${diff > 0 ? '加回' : '扣除'} ${fmtAmt(Math.abs(diff))}）\n\n` +
+      `會在 ${today} 記一筆「對帳校正」，交易紀錄裡看得到，刪掉就還原。只改今天起的餘額，過去的資產走勢不動；績效當成資金進出，不算賺賠。\n\n` +
+      `如果差額是帳務管家那邊記錯，請改去帳務管家修正，不要按這裡。`)) return
+    const tx: Transaction = {
+      id: `${Date.now()}`, date: today, type: diff > 0 ? 'cash_in' : 'cash_out',
+      bank: m.bank, currency: acc.currency, amount: Math.abs(diff),
+      note: '對帳校正（以帳務管家為準）', reconcile: true,
+    }
+    // 存檔會回傳最新的對帳結果，橫幅由 persist 更新
+    await commitAfterSave(base => {
+      // 按下後到輪到存檔之間，切回視窗的存檔可能已經更新了差額：跟最新的不一樣就不記
+      const cur = mismatchesRef.current.find(x => x.bank === m.bank)
+      if (!cur || cur.dashboard !== m.dashboard || cur.ledger !== m.ledger) {
+        setTimeout(() => alert(`「${m.bank}」的差額剛剛更新過，這次沒有校正。請看橫幅上最新的數字，確認後再按一次。`))
+        return { next: base, retro: [] }
+      }
+      let next = applyTransaction(base, tx)
+      next = addSnapshot(next, totalAssetsTwd(next))
+      return { next, retro: [] }
     })
   }, [commitAfterSave])
 
@@ -682,6 +722,22 @@ ${detail}`)) return
               )}
             </div>
           )}
+        </div>
+      )}
+      {mismatches.length > 0 && (
+        <div role="status" className="rounded-md border border-amber-500 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200 space-y-2">
+          <p>⚠️ 現金餘額與帳務管家的帳目不一致。先到帳務管家核對；確定帳務管家是對的，再按「以帳務管家為準校正」。</p>
+          {mismatches.map(m => (
+            <div key={m.bank} className="flex items-center gap-3 flex-wrap">
+              <span className="flex-1">
+                {m.bank}：看板 {m.dashboard.toLocaleString()}／帳目 {m.ledger.toLocaleString()}
+                （差 {Math.abs(Math.round((m.ledger - m.dashboard) * 100) / 100).toLocaleString()}）
+              </span>
+              <Button size="sm" variant="outline" className="h-7 text-xs border-amber-400" onClick={() => void handleReconcile(m)}>
+                以帳務管家為準校正
+              </Button>
+            </div>
+          ))}
         </div>
       )}
       {notices.map((n, i) => (

@@ -52,6 +52,8 @@ pub fn newer_version_message(v: &str) -> String {
     format!("這個資料夾已經被較新版的看板（v{}）使用過，目前開的是 v{}。舊版的同步規則可能把新版整理好的資料改壞，所以只能看、不能存。請關掉這個視窗、改開最新版的看板（如果電腦裡同時裝了兩個版本，請把舊的移除）", v, APP_VERSION)
 }
 pub const DAILY_BACKUP_KEEP: usize = 14;
+/// 每月留一份（該月最早一份完整的每日備份），保留 12 個月：漂移類問題常常幾個月後才發現
+pub const MONTHLY_BACKUP_KEEP: usize = 12;
 /// 當天備份缺檔的標記（同一天再跑會重做）
 pub const INCOMPLETE_MARKER: &str = "_INCOMPLETE.txt";
 
@@ -755,7 +757,57 @@ async fn prune_daily_backups(root: &Path) {
     let mut days = daily_backup_dates(root).await;
     while days.len() > DAILY_BACKUP_KEEP {
         let old = days.remove(0);
+        // 這個月還沒有月備份、而且這份是完整的 → 整份搬去當月備份，不刪
+        let monthly = root.join("backup").join("monthly");
+        let month_dest = monthly.join(&old[..7]);
+        if tokio::fs::metadata(&month_dest).await.is_err()
+            && tokio::fs::metadata(base.join(&old).join(INCOMPLETE_MARKER)).await.is_err()
+            && tokio::fs::create_dir_all(&monthly).await.is_ok()
+        {
+            // 短暫被鎖（雲端同步、防毒）時重試；一直失敗才照舊刪掉，否則每日備份會越積越多
+            let mut moved = false;
+            for ms in RENAME_BACKOFF_MS {
+                if tokio::fs::rename(base.join(&old), &month_dest).await.is_ok() { moved = true; break; }
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+            if moved { continue; }
+        }
         // 先改名成隱藏名稱再刪：刪到一半被中斷，也不會留下看起來完整的半套日期資料夾
+        let doomed = base.join(format!(".deleting-{}", old));
+        if tokio::fs::rename(base.join(&old), &doomed).await.is_ok() {
+            let _ = tokio::fs::remove_dir_all(&doomed).await;
+        }
+    }
+    prune_monthly_backups(root).await;
+}
+
+/// 月備份資料夾（YYYY-MM），由舊到新
+pub async fn monthly_backup_months(root: &Path) -> Vec<String> {
+    let mut months = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(root.join("backup").join("monthly")).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            if is_month_name(&format!("{}.json", name)) { months.push(name); }
+        }
+    }
+    months.sort();
+    months
+}
+
+async fn prune_monthly_backups(root: &Path) {
+    let base = root.join("backup").join("monthly");
+    // 之前淘汰到一半被中斷留下的 .deleting-*
+    if let Ok(mut rd) = tokio::fs::read_dir(&base).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let is_dir = e.file_type().await.map_or(false, |t| t.is_dir());
+            if is_dir && e.file_name().to_string_lossy().starts_with(".deleting-") {
+                let _ = tokio::fs::remove_dir_all(e.path()).await;
+            }
+        }
+    }
+    let mut months = monthly_backup_months(root).await;
+    while months.len() > MONTHLY_BACKUP_KEEP {
+        let old = months.remove(0);
         let doomed = base.join(format!(".deleting-{}", old));
         if tokio::fs::rename(base.join(&old), &doomed).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(&doomed).await;
@@ -862,6 +914,12 @@ pub async fn restore_daily_backup(root: &Path, date: &str) -> Result<(), String>
         }
     };
     txn.sync_key("budget_to_dashboard", Value::Array(restored_ids));
+    // 已同步交易的帳戶紀錄也回到同一個時間點（備份裡沒有就清空：沒有紀錄＝照舊保留，是安全的方向）
+    let restored_accounts = match read_json::<Value>(&src.join("sync.json")).await {
+        FileRead::Ok(v) if v["budget_tx_accounts"].is_object() => v["budget_tx_accounts"].clone(),
+        _ => serde_json::json!({}),
+    };
+    txn.sync_key("budget_tx_accounts", restored_accounts);
     let stale: Vec<String> = daily_backup_dates(root).await.into_iter().filter(|d| d.as_str() > date).collect();
     txn.write_json(RESTORE_MARKER, &serde_json::json!({ "to": date, "stale": stale }))?;
     // snapshots/backup/ 的上一版跟還原前的狀態對不上，一起移走，避免之後被誤用來修復
@@ -1108,6 +1166,38 @@ mod tests {
         }
         assert!(root.join("backup/daily/2026-09-01/transactions.json").exists(), "最舊的好備份還在");
         assert!(!root.join("backup/daily/2026-09-30/transactions.json").exists(), "壞檔沒被備份");
+    }
+
+    // 淘汰的每日備份：每個月最早一份完整的改當月備份，保留 12 個月
+    #[tokio::test]
+    async fn pruned_daily_backups_keep_one_per_month_for_twelve_months() {
+        let root = fresh("monthly_keep");
+        seed(&root);
+        let mut day = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        while day <= end {
+            daily_backup(&root, &day.format("%Y-%m-%d").to_string()).await.unwrap();
+            day = day.succ_opt().unwrap();
+        }
+        assert_eq!(daily_backup_dates(&root).await.len(), DAILY_BACKUP_KEEP);
+        let months = monthly_backup_months(&root).await;
+        assert_eq!(months.len(), MONTHLY_BACKUP_KEEP);
+        assert_eq!(months.first().unwrap(), "2025-10");
+        assert_eq!(months.last().unwrap(), "2026-09");
+        // 月備份是該月第一天那份，內容完整
+        assert!(root.join("backup/monthly/2026-09/transactions.json").exists());
+        assert!(root.join("backup/monthly/2026-09/snapshots/2026-09.json").exists());
+    }
+
+    #[tokio::test]
+    async fn incomplete_daily_backup_is_not_promoted_to_monthly() {
+        let root = fresh("monthly_incomplete");
+        seed(&root);
+        daily_backup(&root, "2026-08-01").await.unwrap();
+        std::fs::write(root.join("backup/daily/2026-08-01").join(INCOMPLETE_MARKER), "x").unwrap();
+        for d in 2..=20 { daily_backup(&root, &format!("2026-08-{:02}", d)).await.unwrap(); }
+        assert!(!root.join("backup/monthly/2026-08").join(INCOMPLETE_MARKER).exists(), "不完整的那份不能當月備份");
+        assert!(root.join("backup/monthly/2026-08/transactions.json").exists(), "改用同月下一份完整的");
     }
 
     #[tokio::test]
