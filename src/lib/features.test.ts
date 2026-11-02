@@ -506,3 +506,51 @@ describe('computeTWR — 歷史 USD 匯率修正', () => {
     expect(Number.isFinite(r!.twr)).toBe(true)
   })
 })
+
+describe('retroactivelyAdjustSnapshots — 轉進之後才建立的帳戶（2026-11-02 IB 事件）', () => {
+  it('快照裡還沒有的現有帳戶當 0 補上，轉帳兩邊都要記到；已刪的帳戶照舊不動', () => {
+    const s = baseState()
+    s.snapshots = [
+      { date: '2025-01-01', total_twd: 360000, holdings_twd: { '美元帳戶': 160000, '台幣帳戶': 200000 } },
+    ]
+    // 台幣帳戶 → 美元帳戶：快照裡沒有美元帳戶（之後才建的）
+    delete s.snapshots[0].holdings_twd!['美元帳戶']
+    const tx: Transaction = {
+      id: 't1', date: '2024-12-31', type: 'transfer',
+      currency: 'TWD', bank: '台幣帳戶', bank_to: '美元帳戶', amount: 32000, amount_to: 1000, currency_to: 'USD',
+    }
+    const r = retroactivelyAdjustSnapshots(s, tx, 1)
+    expect(r.snapshots[0].holdings_twd!['台幣帳戶']).toBe(168000)
+    expect(r.snapshots[0].holdings_twd!['美元帳戶']).toBeCloseTo(1000 * FX, 4)
+    // 已經刪掉的帳戶（不在 cash_accounts）不能被補回來
+    const gone: Transaction = { ...tx, id: 't2', bank_to: '已刪帳戶' }
+    const r2 = retroactivelyAdjustSnapshots(s, gone, 1)
+    expect(r2.snapshots[0].holdings_twd!['已刪帳戶']).toBeUndefined()
+  })
+})
+
+describe('retroactivelyAdjustSnapshots — 補帳戶的規則跟後端一致', () => {
+  const snapNoUsd = () => [{ date: '2025-01-01', total_twd: 200000, holdings_twd: { '台幣帳戶': 200000 } }]
+  const tx: Transaction = {
+    id: 't1', date: '2024-12-31', type: 'transfer',
+    currency: 'TWD', bank: '台幣帳戶', bank_to: '美元帳戶', amount: 32000, amount_to: 1000, currency_to: 'USD',
+  }
+  it('反向沖銷時不補帳戶（當初沒套上，不能沖出負數）', () => {
+    const s = baseState(); s.snapshots = snapNoUsd()
+    const r = retroactivelyAdjustSnapshots(s, tx, -1)
+    expect(r.snapshots[0].holdings_twd!['美元帳戶']).toBeUndefined()
+  })
+  it('那天已過開戶日：起始值是期初金額', () => {
+    const s = baseState(); s.snapshots = snapNoUsd()
+    s.transactions = [{ id: '1700000000000', date: '2024-12-01', type: 'new_cash_account', currency: 'USD', bank: '美元帳戶', amount: 500 }]
+    const r = retroactivelyAdjustSnapshots(s, tx, 1)
+    expect(r.snapshots[0].holdings_twd!['美元帳戶']).toBeCloseTo((500 + 1000) * FX, 4)
+  })
+  it('補登的就是新增持股本身：股數只算一次', () => {
+    const s = baseState(); s.snapshots = snapNoUsd()
+    const np: Transaction = { id: 'n1', date: '2024-12-31', type: 'new_position', currency: 'USD', symbol: 'VOO', shares: 2, price: 400, amount: 800 }
+    s.transactions = [np]
+    const r = retroactivelyAdjustSnapshots(s, np, 1)
+    expect(r.snapshots[0].holdings_twd!['VOO']).toBeCloseTo(800 * FX, 4)
+  })
+})

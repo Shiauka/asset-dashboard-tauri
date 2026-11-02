@@ -416,6 +416,31 @@ export function retroactivelyAdjustSnapshots(
   const toTwd = (amount: number, currency: 'USD' | 'TWD') =>
     currency === 'USD' ? amount * fx : amount
 
+  // 現在還在的帳戶／持股：某天的快照裡沒有（之後才建的）就補上，不能讓那一側的金額消失。
+  // 跟後端 retro_patch 的 ensure_accounts／ensure_holding 同一套規則：
+  // 只有套用（direction 1）才補；起始值＝那天已過建立日就是期初金額，否則 0；已刪的帳戶／持股照舊不動
+  const liveBanks = new Set(state.cash_accounts.map(c => c.bank))
+  const liveSyms = new Set(state.holdings.map(hh => hh.symbol))
+  const created: Record<string, Transaction> = {}
+  for (const t of state.transactions) {
+    const key = t.type === 'new_cash_account' ? `bank:${t.bank}` : t.type === 'new_position' ? `sym:${t.symbol}` : null
+    if (key && (!created[key] || t.id >= created[key].id)) created[key] = t
+  }
+  const baseTwd = (key: string, date: string) => {
+    const c = created[key]
+    if (!c || date < c.date) return 0
+    return c.type === 'new_position' ? toTwd((c.shares ?? 0) * (c.price ?? 0), c.currency) : toTwd(c.amount, c.currency)
+  }
+  // 這筆就是建立持股本身：起始值不能再算一次建立的股數
+  const creating = tx.type === 'new_position'
+  const ensure = (h: Record<string, number>, name: string, kind: 'bank' | 'sym', date: string) => {
+    if (h[name] !== undefined) return true
+    if (direction !== 1 || !(kind === 'bank' ? liveBanks : liveSyms).has(name)) return false
+    h[name] = creating && kind === 'sym' ? 0 : baseTwd(`${kind}:${name}`, date)
+    return true
+  }
+  const has = (h: Record<string, number>, bank: string, date: string) => ensure(h, bank, 'bank', date)
+
   const updatedSnapshots = state.snapshots.map(snap => {
     if (snap.date < tx.date || !snap.holdings_twd) return snap
 
@@ -423,47 +448,47 @@ export function retroactivelyAdjustSnapshots(
 
     switch (tx.type) {
       case 'cash_in':
-        if (tx.bank && h[tx.bank] !== undefined)
-          h[tx.bank] += direction * toTwd(tx.amount, tx.currency)
+        if (tx.bank && has(h, tx.bank, snap.date))
+          h[tx.bank] = (h[tx.bank] ?? 0) + direction * toTwd(tx.amount, tx.currency)
         break
       case 'cash_out':
-        if (tx.bank && h[tx.bank] !== undefined)
-          h[tx.bank] -= direction * toTwd(tx.amount, tx.currency)
+        if (tx.bank && has(h, tx.bank, snap.date))
+          h[tx.bank] = (h[tx.bank] ?? 0) - direction * toTwd(tx.amount, tx.currency)
         break
       case 'buy':
         if (tx.symbol && tx.shares && tx.price) {
           const delta = toTwd(tx.shares * tx.price, tx.currency)
-          h[tx.symbol] = (h[tx.symbol] ?? 0) + direction * delta
-          if (tx.bank && tx.bank !== '__none' && h[tx.bank] !== undefined)
-            h[tx.bank] -= direction * toTwd(tx.amount, tx.currency)
+          if (ensure(h, tx.symbol, 'sym', snap.date)) h[tx.symbol] += direction * delta
+          if (tx.bank && tx.bank !== '__none' && has(h, tx.bank, snap.date))
+            h[tx.bank] = (h[tx.bank] ?? 0) - direction * toTwd(tx.amount, tx.currency)
         }
         break
       case 'sell':
         if (tx.symbol && tx.shares && tx.price) {
           const delta = toTwd(tx.shares * tx.price, tx.currency)
-          h[tx.symbol] = (h[tx.symbol] ?? 0) - direction * delta
-          if (tx.bank && tx.bank !== '__none' && h[tx.bank] !== undefined)
-            h[tx.bank] += direction * toTwd(tx.amount, tx.currency)
+          if (h[tx.symbol] !== undefined) h[tx.symbol] -= direction * delta
+          if (tx.bank && tx.bank !== '__none' && has(h, tx.bank, snap.date))
+            h[tx.bank] = (h[tx.bank] ?? 0) + direction * toTwd(tx.amount, tx.currency)
         }
         break
       case 'new_position':
         if (tx.symbol && tx.shares && tx.price) {
           const delta = toTwd(tx.shares * tx.price, tx.currency)
-          h[tx.symbol] = (h[tx.symbol] ?? 0) + direction * delta
+          if (ensure(h, tx.symbol, 'sym', snap.date)) h[tx.symbol] += direction * delta
         }
         break
       case 'transfer':
-        if (tx.bank && h[tx.bank] !== undefined)
-          h[tx.bank] -= direction * toTwd(tx.amount, tx.currency)
-        if (tx.bank_to && h[tx.bank_to] !== undefined) {
+        if (tx.bank && has(h, tx.bank, snap.date))
+          h[tx.bank] = (h[tx.bank] ?? 0) - direction * toTwd(tx.amount, tx.currency)
+        if (tx.bank_to && has(h, tx.bank_to, snap.date)) {
           const amtTo = tx.amount_to ?? tx.amount
           const curTo = tx.currency_to ?? tx.currency
-          h[tx.bank_to] += direction * toTwd(amtTo, curTo)
+          h[tx.bank_to] = (h[tx.bank_to] ?? 0) + direction * toTwd(amtTo, curTo)
         }
         break
       case 'dividend':
-        if (tx.bank && h[tx.bank] !== undefined)
-          h[tx.bank] += direction * toTwd(tx.amount, tx.currency)
+        if (tx.bank && has(h, tx.bank, snap.date))
+          h[tx.bank] = (h[tx.bank] ?? 0) + direction * toTwd(tx.amount, tx.currency)
         break
     }
 
